@@ -491,7 +491,15 @@ def render_donut_score(score: float, max_score: float = 10.0) -> None:
     fig.patch.set_alpha(0.0)
     ax.patch.set_alpha(0.0)
 
-    colors = ["#3b82f6", "#e2e8f0"]
+        # Farve efter score
+    if val < 4.0:
+        main_color = "#ef4444"  # rød
+    elif val <= 7.0:
+        main_color = "#eab308"  # gul
+    else:
+        main_color = "#22c55e"  # grøn
+
+    colors = [main_color, "#e2e8f0"]
 
     ax.pie(
         [val, remaining],
