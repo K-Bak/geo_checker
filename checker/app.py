@@ -9,7 +9,7 @@ import requests
 from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 import graphviz
-
+import subprocess
 
 # ------------------------------------------------------------
 # CONFIG & STYLING
@@ -20,6 +20,21 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# ... dine andre imports ...
+
+# Denne funktion sikrer, at browseren installeres ved opstart i Cloud
+@st.cache_resource
+def install_playwright_browser():
+    try:
+        # Tjek om vi kan importere, ellers installer
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+        print("Playwright Chromium installed successfully.")
+    except Exception as e:
+        print(f"Error installing Playwright: {e}")
+
+# Kør installationen én gang ved start
+install_playwright_browser()
 
 st.markdown(
     """
