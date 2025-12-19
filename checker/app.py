@@ -1051,7 +1051,7 @@ st.markdown(
 col_spacer1, col_input, col_spacer2 = st.columns([1, 2, 1])
 with col_input:
     with st.container(border=True):
-        mode = st.radio("Vælg input:", ["URL", "Klistr indhold ind"], horizontal=True, label_visibility="collapsed")
+        mode = st.radio("Vælg input:", ["URL", "Indsæt indhold"], horizontal=True, label_visibility="collapsed")
 
         url = ""
         pasted = ""
