@@ -2609,7 +2609,6 @@ if analyze:
             render_findings_list("Technical Signals")
 
         with tab4:
-            st.subheader("🧭 Indexability & Crawlability")
 
             label = indexability.get("label") or "Uncertain"
             blocked = bool(indexability.get("blocked"))
