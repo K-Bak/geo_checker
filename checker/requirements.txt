@@ -5,5 +5,3 @@ matplotlib>=3.8
 graphviz>=0.20
 playwright>=1.42
 pyvis
-spacy
-da-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/da_core_news_sm-3.7.0/da_core_news_sm-3.7.0-py3-none-any.whl
