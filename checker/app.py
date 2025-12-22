@@ -9,7 +9,13 @@ import requests
 from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 import graphviz
-import subprocess
+import streamlit.components.v1 as components
+
+# Optional dependency (better-looking interactive network graph)
+try:
+    from pyvis.network import Network
+except Exception:
+    Network = None
 
 # ------------------------------------------------------------
 # CONFIG & STYLING
@@ -21,32 +27,18 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ... dine andre imports ...
-
-# Denne funktion sikrer, at browseren installeres ved opstart i Cloud
-@st.cache_resource
-def install_playwright_browser():
-    try:
-        # Tjek om vi kan importere, ellers installer
-        subprocess.run(["playwright", "install", "chromium"], check=True)
-        print("Playwright Chromium installed successfully.")
-    except Exception as e:
-        print(f"Error installing Playwright: {e}")
-
-# Kør installationen én gang ved start
-install_playwright_browser()
 
 st.markdown(
     """
 <style>
     /* Generel Baggrund */
-    .stApp { background-color: #f8f9fa; }
+    .stApp { background-color: #fff; }
 
     /* Card Styling */
     .css-card {
-        background-color: #ffffff;
+        background: linear-gradient(90deg, #2563eb 0%, #88b0f1 100%) !important;
         border-radius: 12px;
-        padding: 24px;
+        padding: 1px;
         box-shadow: 0 4px 6px rgba(0,0,0,0.05);
         border: 1px solid #e9ecef;
         margin-bottom: 20px;
@@ -104,6 +96,52 @@ st.markdown(
         background-color: #ffffff;
         border-radius: 8px;
         border: 1px solid #f1f5f9;
+    }
+        /* ---------- Primary CTA button styling (blue, not red) ---------- */
+    .stButton > button {
+        background: linear-gradient(90deg, #2563eb 0%, #3b82f6 100%) !important;
+        color: #ffffff !important;
+        border: 0 !important;
+        border-radius: 12px !important;
+        padding: 12px 18px !important;
+        font-weight: 700 !important;
+        font-size: 14px !important;
+        box-shadow: 0 10px 22px rgba(37, 99, 235, 0.25) !important;
+        transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease;
+        width: 100% !important;
+        max-width: 520px !important;
+        margin: 10px auto !important;
+        display: block !important;
+    }
+    .stButton > button:hover {
+        filter: brightness(1.03);
+        transform: translateY(-1px);
+        box-shadow: 0 14px 28px rgba(37, 99, 235, 0.30) !important;
+    }
+    .stButton > button:active {
+        transform: translateY(0px);
+        box-shadow: 0 10px 22px rgba(37, 99, 235, 0.22) !important;
+    }
+    /* Tabs: make active accent blue (avoid red underline) */
+    div[data-baseweb="tab"][aria-selected="true"] > div {
+        color: #2563eb !important;
+    }
+    div[data-baseweb="tab-highlight"] {
+        background-color: #2563eb !important;
+    }
+    .st-emotion-cache-xhkv9f {
+        margin:auto;
+    }
+
+    /* ---------- Radio buttons: force blue accent instead of red ---------- */
+    input[type="radio"] {
+        accent-color: #2563eb !important; /* Tailwind blue-600 */
+    }
+
+    /* Streamlit-specific fallback (older WebKit) */
+    div[role="radiogroup"] svg {
+        color: #2563eb !important;
+        fill: #2563eb !important;
     }
 </style>
 """,
@@ -194,40 +232,6 @@ def fetch_url_uncached(url: str) -> Tuple[str, str, int, Dict[str, str]]:
     except Exception as e:
         return url, "", 0, {"Error": str(e)}
 
-def fetch_url_playwright(url: str) -> Tuple[str, str, int, Dict[str, str]]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as e:
-        raise RuntimeError(
-            "Playwright er ikke installeret. Kør: pip install playwright  &&  playwright install chromium"
-        ) from e
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=USER_AGENT,
-            locale="da-DK",
-            extra_http_headers={"Accept-Language": "da,en-US;q=0.8,en;q=0.7"},
-        )
-        page = context.new_page()
-        try:
-            resp = page.goto(url, wait_until="domcontentloaded", timeout=35_000)
-            try:
-                page.wait_for_timeout(1500)
-            except Exception:
-                pass
-
-            final_url = page.url
-            html = page.content()
-            status = resp.status if resp else 0
-            headers = dict(resp.headers) if resp else {}
-        except Exception:
-            return url, "", 0, {}
-        finally:
-            context.close()
-            browser.close()
-
-    return final_url, html or "", status, headers
 
 def build_from_paste(pasted_content: str) -> Tuple[str, str, int, Dict[str, str]]:
     if "<" not in pasted_content and ">" not in pasted_content:
@@ -361,6 +365,161 @@ def extract_meta(html: str) -> Dict[str, str]:
 
     return out
 
+# --------------------- Indexability/robots helpers ---------------------
+def parse_robots_directives(value: str) -> List[str]:
+    if not value:
+        return []
+    # Split on commas/semicolons and normalize
+    parts = re.split(r"[,;]", value)
+    return sorted({p.strip().lower() for p in parts if p and p.strip()})
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def fetch_robots_txt(host_url: str) -> Tuple[int, str]:
+    """Fetch robots.txt. Returns (status_code, text)."""
+    try:
+        base = host_url.rstrip("/")
+        robots_url = f"{base}/robots.txt"
+        r = requests.get(
+            robots_url,
+            headers={"User-Agent": USER_AGENT, "Accept": "text/plain,*/*"},
+            timeout=15,
+            allow_redirects=True,
+        )
+        return r.status_code, r.text or ""
+    except Exception:
+        return 0, ""
+
+def robots_txt_allows(url: str, robots_txt: str) -> Tuple[Optional[bool], Optional[str]]:
+    """Very small heuristic parser for User-agent:* rules.
+
+    Returns (allowed?, matched_rule). allowed? is:
+      - True/False if we could evaluate a matching rule
+      - None if robots.txt is empty/unparseable
+    """
+    if not robots_txt or not url:
+        return None, None
+
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    lines = []
+    for raw in robots_txt.splitlines():
+        ln = raw.split("#", 1)[0].strip()
+        if ln:
+            lines.append(ln)
+
+    # Collect rules in UA groups; we only consider User-agent: *
+    in_star_group = False
+    disallows: List[str] = []
+    allows: List[str] = []
+
+    for ln in lines:
+        low = ln.lower()
+        if low.startswith("user-agent:"):
+            ua = ln.split(":", 1)[1].strip()
+            in_star_group = (ua == "*")
+            continue
+        if not in_star_group:
+            continue
+        if low.startswith("disallow:"):
+            rule = ln.split(":", 1)[1].strip()
+            disallows.append(rule)
+        elif low.startswith("allow:"):
+            rule = ln.split(":", 1)[1].strip()
+            allows.append(rule)
+
+    if not disallows and not allows:
+        return None, None
+
+    def matches(rule: str, p: str) -> bool:
+        if rule is None:
+            return False
+        rule = rule.strip()
+        # Empty Disallow means allow all
+        if rule == "":
+            return False
+        return p.startswith(rule)
+
+    # Longest-match wins (common robots heuristic)
+    best_allow = ""
+    for r in allows:
+        if r and matches(r, path) and len(r) > len(best_allow):
+            best_allow = r
+
+    best_disallow = ""
+    for r in disallows:
+        if r and matches(r, path) and len(r) > len(best_disallow):
+            best_disallow = r
+
+    if best_allow and (len(best_allow) >= len(best_disallow)):
+        return True, f"Allow: {best_allow}"
+    if best_disallow:
+        return False, f"Disallow: {best_disallow}"
+
+    return True, None
+
+def compute_indexability(final_url: str, status: int, meta: Dict[str, str], headers: Dict[str, str]) -> Dict[str, Any]:
+    """Compute basic indexability signals (heuristic)."""
+    meta_robots_raw = (meta.get("robots") or "").strip()
+
+    # Header keys can vary in casing
+    x_robots_raw = ""
+    for k, v in (headers or {}).items():
+        if k.lower() == "x-robots-tag":
+            x_robots_raw = (v or "").strip()
+            break
+
+    meta_dirs = parse_robots_directives(meta_robots_raw)
+    x_dirs = parse_robots_directives(x_robots_raw)
+
+    meta_noindex = "noindex" in meta_dirs
+    header_noindex = "noindex" in x_dirs
+
+    # robots.txt check (only when we have a real URL)
+    robots_status, robots_txt = (0, "")
+    robots_allows, robots_rule = (None, None)
+    if final_url and final_url.startswith(("http://", "https://")):
+        base = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
+        robots_status, robots_txt = fetch_robots_txt(base)
+        robots_allows, robots_rule = robots_txt_allows(final_url, robots_txt)
+
+    # Decide
+    blocked_reasons: List[str] = []
+    if status and status >= 400:
+        blocked_reasons.append(f"HTTP {status}")
+    if meta_noindex:
+        blocked_reasons.append("meta robots=noindex")
+    if header_noindex:
+        blocked_reasons.append("X-Robots-Tag=noindex")
+    if robots_allows is False:
+        blocked_reasons.append("robots.txt disallow")
+
+    # High-level label
+    if meta_noindex or header_noindex:
+        label = "Noindex"
+    elif status and status >= 400:
+        label = "Not reachable"
+    elif robots_allows is False:
+        label = "Blocked by robots.txt"
+    elif status in (200, 201, 202) and not blocked_reasons:
+        label = "Indexable"
+    else:
+        label = "Uncertain"
+
+    return {
+        "label": label,
+        "blocked": bool(blocked_reasons),
+        "blocked_reasons": blocked_reasons,
+        "status": status,
+        "meta_robots": meta_robots_raw,
+        "x_robots_tag": x_robots_raw,
+        "robots_txt_status": robots_status,
+        "robots_txt_allows": robots_allows,
+        "robots_txt_rule": robots_rule,
+    }
+
 def find_nap_signals(html: str) -> Dict[str, Optional[str]]:
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n", strip=True)
@@ -432,22 +591,94 @@ def count_external_citations(ext_links: List[str]) -> int:
     cites = [u for u in ext_links if u not in socials]
     return len(set(cites))
 
-def guess_page_type(title: str, headings: Dict[str, List[str]], text: str) -> str:
-    hay = " ".join([title] + headings.get("h1", []) + headings.get("h2", [])).lower()
+def guess_page_type(
+    title: str,
+    headings: Dict[str, List[str]],
+    text: str,
+    url: str = "",
+    schema_types: Optional[List[str]] = None,
+) -> str:
+    """Best-effort page type classifier.
+
+    NOTE: This tool needs to distinguish at least:
+      - Product Page (webshop PDP)
+      - Service Page
+      - Content / Article
+      - General Page
+
+    We use a blend of URL patterns, schema types (when available), and textual cues.
+    """
+    schema_types = schema_types or []
+    norm_types = {norm_schema_type(t) for t in schema_types if t}
+
+    t_low = (title or "").lower()
+    h1 = " ".join(headings.get("h1", []) or []).lower()
+    h2 = " ".join(headings.get("h2", []) or []).lower()
+    hay = " ".join([t_low, h1, h2]).strip()
+
+    url_low = (url or "").lower()
+
+    # -----------------
+    # 1) Product page
+    # -----------------
+    # Strong signals: Product/Offer schema OR URL looks like PDP OR typical PDP UI words.
+    product_url_signals = [
+        "/products/", "/product/", "?variant=", "/p/", "/item/", "/shop/",
+    ]
+    product_schema_signals = {"Product", "Offer", "AggregateRating", "Review", "ItemList"}
+    product_text_terms = [
+        "add to cart", "læg i kurv", "læg i indkøbskurv", "køb", "køb nu",
+        "variant", "varianter", "størrelse", "farve", "lager", "på lager", "udsolgt",
+        "levering", "fri fragt", "retur", "betaling", "pris", "kr", "dkk",
+        "ingredients", "ingredienser", "anmeldelser", "ratings", "specifikation",
+    ]
+
+    has_product_schema = bool(norm_types.intersection(product_schema_signals))
+    looks_like_product_url = any(s in url_low for s in product_url_signals)
+    looks_like_product_text = any(w in hay for w in product_text_terms) or any(w in (text or "")[:2500].lower() for w in product_text_terms)
+
+    # Product page if schema says so OR URL strongly suggests PDP OR text has strong PDP terms.
+    if has_product_schema:
+        return "Product Page"
+
+    if looks_like_product_url:
+        return "Product Page"
+
+    if looks_like_product_text and any(s in url_low for s in ["/collections/", "/product", "/shop", "/p/"]):
+        return "Product Page"
+
+    # -----------------
+    # 2) Service page
+    # -----------------
     service_terms = [
         "service", "ydelse", "vi tilbyder", "pris", "tilbud", "bestil",
         "kontakt", "fliserens", "tagrens", "facaderens", "alge",
         "imprægner", "rengøring", "behandling", "rens", "terrasse",
     ]
-    blog_terms = ["blog", "nyhed", "artikel", "guide", "sådan", "tips", "viden", "råd"]
 
     if any(t in hay for t in service_terms):
         return "Service Page"
+
+    # -----------------
+    # 3) Content/article
+    # -----------------
+    blog_terms = ["blog", "nyhed", "artikel", "guide", "sådan", "tips", "viden", "råd"]
     if any(t in hay for t in blog_terms):
         return "Content / Article"
-    if len(text) < 1500:
-        return "Service Page"
+
+    # -----------------
+    # 4) Fallbacks
+    # -----------------
+    # If schema strongly indicates a product-ish entity but we missed the above, still classify as Product.
+    if "Product" in norm_types or "Offer" in norm_types:
+        return "Product Page"
+
+    # Lightweight fallback on length
+    if len((text or "")) < 1500:
+        return "General Page"
+
     return "General Page"
+
 
 def detect_unsourced_claims(text: str, ext_links: List[str]) -> List[str]:
     patterns = [
@@ -473,6 +704,361 @@ def detect_unsourced_claims(text: str, ext_links: List[str]) -> List[str]:
         if m:
             matches.append(m.group(0))
     return list(set(matches))
+
+# ------------------------------------------------------------
+# Product extraction (for Product Page entity maps)
+# ------------------------------------------------------------
+
+def _safe_str(x: Any) -> str:
+    try:
+        return str(x).strip()
+    except Exception:
+        return ""
+
+def _first_nonempty(*vals: Any) -> str:
+    for v in vals:
+        s = _safe_str(v)
+        if s:
+            return s
+    return ""
+
+def _as_list(x: Any) -> List[Any]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    return [x]
+
+def _schema_find_first(obj: Any, key: str) -> Any:
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj.get(key)
+        for v in obj.values():
+            found = _schema_find_first(v, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for it in obj:
+            found = _schema_find_first(it, key)
+            if found is not None:
+                return found
+    return None
+
+def extract_product_signals(
+    html: str,
+    final_url: str,
+    title: str,
+    headings: Dict[str, List[str]],
+    meta: Dict[str, str],
+    schema_objs: List[Dict[str, Any]],
+    text: str,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "product_name": "",
+        "brand": "",
+        "collection": "",
+        "price": "",
+        "currency": "",
+        "availability": "",
+        "sku": "",
+        "offers_count": 0,
+        "variants": [],
+    }
+
+    url_low = (final_url or "").lower()
+
+    # Collection from URL (Shopify typical)
+    m = re.search(r"/collections/([^/?#]+)", url_low)
+    if m:
+        out["collection"] = m.group(1).replace("-", " ").strip().title()
+
+    # Find Product schema object
+    product_obj: Optional[Dict[str, Any]] = None
+    for o in schema_objs or []:
+        t = o.get("@type")
+        ts = [t] if isinstance(t, str) else (t if isinstance(t, list) else [])
+        ts = [norm_schema_type(str(x)) for x in ts]
+        if any(x.lower() == "product" for x in ts):
+            product_obj = o
+            break
+
+    if product_obj:
+        out["product_name"] = _first_nonempty(product_obj.get("name"), product_obj.get("headline"))
+
+        b = product_obj.get("brand")
+        if isinstance(b, dict):
+            out["brand"] = _first_nonempty(b.get("name"), b.get("@id"))
+        elif isinstance(b, str):
+            out["brand"] = b.strip()
+
+        out["sku"] = _first_nonempty(product_obj.get("sku"), product_obj.get("mpn"))
+
+        offers_list = _as_list(product_obj.get("offers"))
+        out["offers_count"] = len(offers_list)
+
+        offer_summary: Optional[Dict[str, Any]] = None
+        for off in offers_list:
+            if isinstance(off, dict):
+                offer_summary = off
+                break
+
+        if offer_summary:
+            price = _first_nonempty(offer_summary.get("price"), _schema_find_first(offer_summary, "price"))
+            currency = _first_nonempty(offer_summary.get("priceCurrency"), _schema_find_first(offer_summary, "priceCurrency"))
+            availability = _first_nonempty(offer_summary.get("availability"), _schema_find_first(offer_summary, "availability"))
+
+            out["price"] = price
+            out["currency"] = currency
+
+            if availability and "schema.org" in availability:
+                out["availability"] = availability.rsplit("/", 1)[-1]
+            else:
+                out["availability"] = availability
+
+        variants = product_obj.get("hasVariant") or product_obj.get("isVariantOf")
+        for v in _as_list(variants):
+            if isinstance(v, dict):
+                nm = _first_nonempty(v.get("name"), v.get("sku"), v.get("mpn"))
+                if nm:
+                    out["variants"].append(nm)
+            elif isinstance(v, str) and v.strip():
+                out["variants"].append(v.strip())
+
+    # DOM fallbacks
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+
+        h1s = headings.get("h1", []) or []
+        out["product_name"] = _first_nonempty(
+            out.get("product_name"),
+            meta.get("og:title"),
+            (h1s[0] if h1s else ""),
+            title,
+        )
+
+        og_site = (meta.get("og:site_name") or "").strip()
+        if not out.get("brand") and og_site:
+            out["brand"] = og_site
+
+        if not out.get("price"):
+            for sel in [
+                ("meta", {"property": "product:price:amount"}, "content"),
+                ("meta", {"property": "og:price:amount"}, "content"),
+                ("meta", {"itemprop": "price"}, "content"),
+                ("span", {"itemprop": "price"}, None),
+            ]:
+                tag = soup.find(sel[0], attrs=sel[1])
+                if tag:
+                    val = (tag.get(sel[2]) if sel[2] else tag.get_text(" ", strip=True))
+                    if val:
+                        out["price"] = str(val).strip()
+                        break
+
+        if not out.get("currency"):
+            tag = soup.find("meta", attrs={"itemprop": "priceCurrency"})
+            if tag and tag.get("content"):
+                out["currency"] = tag.get("content").strip()
+
+        if not out.get("availability"):
+            snippet = (text or "")[:2500].lower()
+            if "på lager" in snippet or "in stock" in snippet:
+                out["availability"] = "InStock"
+            elif "udsolgt" in snippet or "out of stock" in snippet:
+                out["availability"] = "OutOfStock"
+
+    out["variants"] = list(dict.fromkeys([v for v in out.get("variants", []) if v]))[:6]
+    return out
+
+# ------------------------------------------------------------
+# Topic entity extraction (brands/products/etc.) for entity map
+# ------------------------------------------------------------
+
+# --- spaCy loader helper (module-level, before extract_topic_entities) ---
+@st.cache_resource(show_spinner=False)
+def _load_spacy_model():
+    """Try DK model first, else multilingual fallback."""
+    try:
+        import spacy  # type: ignore
+    except Exception:
+        spacy = None
+    if spacy is None:
+        return None
+    for model_name in ("da_core_news_sm", "xx_ent_wiki_sm"):
+        try:
+            return spacy.load(model_name)
+        except Exception:
+            continue
+    return None
+
+def extract_topic_entities(title: str, headings: Dict[str, List[str]], text: str, max_entities: int = 18) -> List[Tuple[str, int]]:
+    """Extract topic entities for the entity map.
+
+    Prefer real NER (spaCy) when available. Fall back to a lightweight heuristic
+    (capitalized phrases) when spaCy isn't installed or a model isn't available.
+    """
+    h1 = " ".join(headings.get("h1", []) or [])
+    h2 = " ".join(headings.get("h2", []) or [])
+    h3 = " ".join(headings.get("h3", []) or [])
+
+    # Use a weighted snippet rather than the entire page text (reduces nav/UI noise)
+    text_snippet = (text or "")[:3500]
+    weighted = (" ".join([title, title, h1, h1, h2, h2, h3]) + " " + text_snippet).strip()
+    if not weighted:
+        return []
+
+    banned_exact = {
+        "WebPage", "Organization", "LocalBusiness", "Service", "Service Offer",
+        "Author", "Author (Text)", "FAQ", "GDPR", "Danmark", "Denmark",
+    }
+    banned_contains = {
+        "cookie", "privatliv", "vilkår", "betingelser", "login", "konto", "nyhedsbrev",
+        "menu", "navigation", "søge", "søg", "filtrer", "sorter", "vælg", "klik",
+        "læs", "download", "book", "bestil", "kontakt",
+        "i18n", "error", "fejl",
+    }
+    stopwords_lower = {
+        # Pronouns / function words
+        "vi", "jeg", "du", "i", "man", "den", "det", "de", "der", "som", "for", "med", "til", "på", "af", "om", "og", "men", "så",
+        "en", "et", "eller", "at", "ikke", "kun", "også", "derfor", "altså",
+        # Common UI / CTA words that often show up in menus
+        "vælg", "læs", "se", "klik", "kontakt", "bestil", "book", "ring", "få", "tilbud", "udfyld",
+        # Common weak verbs/adverbs that we do not want as entities
+        "skal", "kan", "må", "ofte", "altid", "uanset", "dette", "vores", "din", "jeres",
+        # Additional stopwords
+        "på", "hvad", "hos", "her", "nu", "mere", "mindre", "bedste", "resultat", "til",
+        # Common product-option / UI noise we don't want as entities
+        "tilføj", "normal", "i18n", "error", "fejl",
+    }
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").strip())
+
+    def _is_noise(ent: str) -> bool:
+        if not ent or len(ent) < 3:
+            return True
+        if ent in banned_exact:
+            return True
+
+        low = ent.lower().strip()
+
+        # Hard-kill common UI/tech artifacts that slip through (seen on webshop PDPs)
+        if "i18n" in low:
+            return True
+        if "error" in low or "fejl" in low:
+            return True
+
+        # Tokenize on whitespace for smarter stopword/noise filtering
+        tokens = [t for t in re.split(r"\s+", low) if t]
+        # If any token is a stopword-like UI word, treat short entities as noise
+        if len(tokens) <= 2 and any(t in {"tilføj", "normal"} for t in tokens):
+            return True
+        if not tokens:
+            return True
+
+        # Remove exact stopwords
+        if low in stopwords_lower:
+            return True
+
+        # Single-token entities must be reasonably long and not function-words
+        if len(tokens) == 1:
+            if len(tokens[0]) <= 3:
+                return True
+            if tokens[0] in stopwords_lower:
+                return True
+
+        # If the entity is short (1–2 tokens) and contains any stopword, treat as noise
+        if len(tokens) <= 2 and any(t in stopwords_lower for t in tokens):
+            return True
+
+        # If 50%+ of tokens are stopwords, it's almost certainly not an entity
+        sw_ratio = sum(1 for t in tokens if t in stopwords_lower) / max(1, len(tokens))
+        if sw_ratio >= 0.5:
+            return True
+
+        if any(b in low for b in banned_contains):
+            return True
+        if re.fullmatch(r"[\d\s.,-]+", ent):  # prices / numbers
+            return True
+
+        # Ignore shouty ALLCAPS phrases (menus/headlines)
+        letters = re.sub(r"[^A-Za-zÆØÅæøå]", "", ent)
+        if letters and letters.isupper() and len(letters) >= 6:
+            return True
+
+        # Special: patterns like "FACADERENS Hvad" (ALLCAPS + stopword-like second token)
+        raw_tokens = [t for t in re.split(r"\s+", ent.strip()) if t]
+        if len(raw_tokens) >= 2:
+            first_letters = re.sub(r"[^A-Za-zÆØÅæøå]", "", raw_tokens[0])
+            second_low = raw_tokens[1].lower()
+            if first_letters and first_letters.isupper() and len(first_letters) >= 5 and second_low in stopwords_lower:
+                return True
+
+        if ent.isupper() and len(ent) <= 4:  # EU/DK etc.
+            return True
+        return False
+
+    # --- 1) spaCy NER path ---
+    nlp = _load_spacy_model()
+    if nlp is not None:
+        try:
+            doc = nlp(weighted)
+            counts: Dict[str, int] = {}
+
+            allowed_labels = {"ORG", "PERSON", "PRODUCT", "GPE", "LOC", "EVENT", "WORK_OF_ART"}
+
+            for ent in doc.ents:
+                label = getattr(ent, "label_", "")
+                txt = _norm(ent.text)
+
+                if label and label not in allowed_labels:
+                    continue
+                if _is_noise(txt):
+                    continue
+                if txt.lower() in stopwords_lower:
+                    continue
+                if len(txt) > 60:
+                    continue
+
+                counts[txt] = counts.get(txt, 0) + 1
+
+            ranked = sorted(counts.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
+            return ranked[:max_entities]
+        except Exception:
+            pass  # fall back
+
+    # --- 2) Heuristic fallback ---
+    phrase_re = re.compile(
+        r"\b[A-ZÆØÅ][A-Za-zÆØÅæøå0-9&/+'\-]{2,}(?:\s+[A-ZÆØÅ][A-Za-zÆØÅæøå0-9&/+'\-]{2,}){0,3}\b"
+    )
+
+    counts: Dict[str, int] = {}
+    for m in phrase_re.finditer(weighted):
+        ent = _norm(m.group(0))
+        if _is_noise(ent):
+            continue
+        if ent.lower() in stopwords_lower:
+            continue
+        counts[ent] = counts.get(ent, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
+    out: List[Tuple[str, int]] = []
+    for ent, c in ranked:
+        if len(out) >= max_entities:
+            break
+
+        # Prefer multi-word entities; single words must be strong
+        if " " not in ent:
+            if c <= 1:
+                continue
+            if len(ent) < 5:
+                continue
+
+        # Drop weak, short, one-off phrases
+        if c <= 1 and len(ent) < 8:
+            continue
+
+        out.append((ent, c))
+    return out
 
 def quick_wins(findings: List[Finding], max_items: int = 6) -> List[Finding]:
     wins = [f for f in findings if f.impact >= 4 and f.effort_minutes <= 30]
@@ -535,11 +1121,221 @@ def render_graphviz_map(payload: Dict[str, Any]):
         graph.node(nid, label=label, style=style, fillcolor=fill, color=bordercolor, fontcolor=fontcolor)
 
     for e in edges:
+        src = e.get("from")
+        dst = e.get("to")
+        if not src or not dst:
+            continue
+
+        rel = e.get("rel", "")
         style = e.get("style", "solid")
-        color = "#dc2626" if style == "dashed" else "#94a3b8"
-        graph.edge(e.get("from"), e.get("to"), label=e.get("rel", ""), style=style, color=color, fontcolor=color)
+
+        if style == "missing":
+            edge_style = "dashed"
+            color = "#ef4444"
+        elif style in ("weak", "dashed"):
+            edge_style = "dashed"
+            color = "#94a3b8"
+        else:
+            edge_style = "solid"
+            color = "#94a3b8"
+
+        graph.edge(str(src), str(dst), label=str(rel), style=edge_style, color=color, fontcolor=color)
 
     st.graphviz_chart(graph, use_container_width=True)
+
+def render_entity_map(payload: Dict[str, Any], height_px: int = 700) -> None:
+    """Interactive entity map (PyVis/vis.js) with Graphviz fallback."""
+    if Network is None:
+        st.info("Interaktiv graf kræver 'pyvis'. Viser fallback-graf i stedet.")
+        render_graphviz_map(payload)
+        return
+
+    nodes = payload.get("nodes", [])
+    edges = payload.get("edges", [])
+
+    net = Network(height=f"{height_px}px", width="100%", directed=True, bgcolor="#ffffff")
+
+    # Physics tuned for readable layout
+    net.barnes_hut(
+        gravity=-9000,
+        central_gravity=0.25,
+        spring_length=160,
+        spring_strength=0.02,
+        damping=0.35,
+        overlap=0.4,
+    )
+
+    # NOTE: PyVis expects a JSON string here (not JS like `var options = {...}`)
+    options = {
+        "nodes": {
+            "shape": "dot",
+            "borderWidth": 2,
+            "font": {"size": 14, "face": "Helvetica", "color": "#0f172a"},
+        },
+        "edges": {
+            "color": {"color": "#94a3b8"},
+            "smooth": {"type": "dynamic"},
+            "arrows": {"to": {"enabled": True, "scaleFactor": 0.7}},
+            "font": {"size": 12, "color": "#64748b", "align": "middle"},
+        },
+        "physics": {"enabled": True},
+        "interaction": {
+            "hover": True,
+            "dragNodes": True,
+            "dragView": True,
+            "zoomView": True,
+        },
+    }
+    net.set_options(json.dumps(options))
+
+    def infer_group(ntype: str, nid: str) -> str:
+        t = (ntype or "").lower()
+        if "person" in t or "author" in t:
+            return "author"
+        if "organization" in t or "localbusiness" in t or nid == "org":
+            return "org"
+        if "product" in t or nid == "product":
+            return "product"
+        if "brand" in t or nid == "brand":
+            return "brand"
+        if "collection" in t or nid == "collection":
+            return "collection"
+        if "offer" in t or nid == "offer":
+            return "offer"
+        if "price" in t or nid == "price":
+            return "price"
+        if "availability" in t or nid == "availability":
+            return "availability"
+        if "variant" in t or nid.startswith("variant_"):
+            return "variant"
+        if "service" in t:
+            return "service"
+        if "cited" in t:
+            return "cited"
+        if "missing" in t or nid.startswith("miss_"):
+            return "missing"
+        if "page" in t or nid == "page":
+            return "page"
+        return "topic"
+
+    group_colors = {
+        "author": ("#3b82f6", "#3b82f6"),
+        "org": ("#7c3aed", "#7c3aed"),
+        "product": ("#10b981", "#10b981"),
+        "brand": ("#60a5fa", "#60a5fa"),
+        "collection": ("#a78bfa", "#a78bfa"),
+        "offer": ("#f59e0b", "#f59e0b"),
+        "price": ("#fb923c", "#fb923c"),
+        "availability": ("#94a3b8", "#94a3b8"),
+        "variant": ("#22c55e", "#22c55e"),
+        "topic": ("#22c55e", "#22c55e"),
+        "cited": ("#f59e0b", "#f59e0b"),
+        "missing": ("#e5e7eb", "#ef4444"),
+        "service": ("#10b981", "#10b981"),
+        "page": ("#e2e8f0", "#94a3b8"),
+    }
+
+    for n in nodes:
+        nid = n.get("id")
+        if not nid:
+            continue
+
+        label = n.get("label", nid)
+        ntype = n.get("type", "")
+        style = n.get("style", "")
+        group = n.get("group") or infer_group(str(ntype), str(nid))
+
+        fill, border = group_colors.get(group, ("#e2e8f0", "#94a3b8"))
+
+        is_missing = ("dashed" in str(style)) or (group == "missing")
+        if is_missing:
+            border = "#ef4444"
+            font_color = "#ef4444"
+        else:
+            font_color = "#0f172a"
+
+        default_size = 18
+        if group in ("product",):
+            default_size = 38
+        elif group in ("org", "service"):
+            default_size = 28
+        elif group in ("brand", "collection"):
+            default_size = 24
+        elif group in ("offer",):
+            default_size = 22
+        elif group in ("author",):
+            default_size = 22
+        elif group in ("cited",):
+            default_size = 20
+        elif group in ("page",):
+            default_size = 24
+        elif group in ("price", "availability"):
+            default_size = 18
+        elif group in ("variant",):
+            default_size = 16
+        elif group in ("missing",):
+            default_size = 22
+        elif group in ("topic",):
+            default_size = 22
+
+        size = int(n.get("size", default_size))
+        title = f"{label}<br><span style='color:#64748b'>({ntype})</span>"
+
+        net.add_node(
+            nid,
+            label=label,
+            title=title,
+            size=size,
+            color={"background": fill, "border": border},
+            font={"color": font_color},
+        )
+
+    for e in edges:
+        src = e.get("from")
+        dst = e.get("to")
+        if not src or not dst:
+            continue
+
+        rel = e.get("rel", "")
+        style = e.get("style", "solid")
+        dashed = (style == "dashed")
+        color = "#ef4444" if dashed else "#94a3b8"
+        net.add_edge(src, dst, label=rel, dashes=dashed, color=color)
+
+    legend_html = """
+<div style="font-family: Helvetica, Arial, sans-serif; padding: 12px 6px 10px 6px;">
+  <div style="font-size:18px; font-weight:700; color:#0f172a;">Entity Relationship Map</div>
+  <div style="color:#64748b; margin-top:2px;">Visual representation of entities AI sees in your content</div>
+
+  <div style="display:flex; gap:18px; flex-wrap:wrap; margin-top:12px; align-items:center;">
+    <div style="display:flex; align-items:center; gap:8px;">
+      <span style="width:10px; height:10px; border-radius:999px; background:#3b82f6; display:inline-block;"></span> Author
+    </div>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <span style="width:10px; height:10px; border-radius:999px; background:#7c3aed; display:inline-block;"></span> Organization
+    </div>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <span style="width:10px; height:10px; border-radius:999px; background:#22c55e; display:inline-block;"></span> Topic Entity
+    </div>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <span style="width:10px; height:10px; border-radius:999px; background:#f59e0b; display:inline-block;"></span> Cited Entity
+    </div>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <span style="width:10px; height:10px; border-radius:999px; background:#e5e7eb; border:2px solid #ef4444; display:inline-block;"></span> Missing Entity
+    </div>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <span style="width:10px; height:10px; border-radius:999px; border:2px solid #22c55e; display:inline-block;"></span> ✓ Has Markup
+    </div>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <span style="width:10px; height:10px; border-radius:999px; border:2px solid #ef4444; display:inline-block;"></span> ⚠ Not Recognized
+    </div>
+  </div>
+</div>
+"""
+
+    html = net.generate_html()
+    html = html.replace("<body>", "<body>" + legend_html, 1)
+    components.html(html, height=height_px + 160, scrolling=False)
 
 def schema_snippet_suggestions(page_type: str) -> Dict[str, str]:
     org = {
@@ -601,7 +1397,10 @@ def score_and_findings(
     ext_links: List[str],
     meta: Dict[str, str],
     nap: Dict[str, Optional[str]],
-) -> Tuple[float, float, float, float, List[Finding], Dict[str, Any], Dict[str, Any]]:
+    indexability: Dict[str, Any],
+    final_url: str = "",
+    raw_html: str = "",
+) -> Tuple[float, float, float, float, List[Finding], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     findings: List[Finding] = []
 
     # --- 1) Base signals ---
@@ -631,6 +1430,11 @@ def score_and_findings(
     meta_desc = (meta.get("description") or "").strip()
     has_canonical = bool((meta.get("canonical") or "").strip())
 
+    # Indexability (hard gate for Technical)
+    is_blocked = bool((indexability or {}).get("blocked"))
+    index_label = (indexability or {}).get("label") or "Uncertain"
+    index_reasons = ", ".join((indexability or {}).get("blocked_reasons") or [])
+
     # Pricing / process / area / faq / before-after / contact CTA
     has_pricing = bool(re.search(r"\b(pris|priser|fra\s+\d+|kr\.?|dkk)\b", text, re.I))
     has_process = bool(re.search(r"\b(sådan\s+foregår|proces|trin\s+\d|step\s+\d|fremgangsmåde)\b", text, re.I))
@@ -649,99 +1453,217 @@ def score_and_findings(
     high_trust_domains = ("mst.dk", "miljo", "miljø", "ds.dk", "iso.org", "ecolabel", "svanemaerket", "svanemærket", "sikkerhedsdatablad", "sds")
     trusted_out_links = [u for u in ext_links if any(k in u.lower() for k in high_trust_domains)]
 
+    # Expert quotes / attribution (simple heuristic)
+    # Used by requirements + findings. We treat either explicit attribution language
+    # or at least one high-trust external link as a positive signal.
+    has_expert_quotes = bool(
+        re.search(
+            r"\b(ifølge|kilde\s*:|source\s*:|referenc\w*|rapport|studie|undersøgelse|data\s+fra|SDS|sikkerhedsdatablad|standard|myndighed)\b",
+            text or "",
+            re.I,
+        )
+    ) or (len(trusted_out_links) >= 1)
+
     # NAP presence
     nap_phone = bool(nap.get("phone"))
     nap_email = bool(nap.get("email"))
     nap_address = bool(nap.get("address"))
     nap_cvr = bool(nap.get("cvr"))
 
-    # --- 3) Scoring ---
-    # Entity Authority (0-10)
-    entity_score = 0.0
-    if person_obj or author_visible:
-        entity_score += 2.5
-    if org_obj:
-        entity_score += 3.0
-    if nap_phone or nap_email:
-        entity_score += 1.0
-    if nap_address:
-        entity_score += 1.0
-    if nap_cvr:
-        entity_score += 1.0
-    if len(socials) >= 2:
-        entity_score += 1.5
-    elif len(socials) == 1:
-        entity_score += 0.8
-    if has_about:
-        entity_score += 0.8
-    if has_contact:
-        entity_score += 0.8
+    # --- 3) Scoring (single source of truth: score = 10 - missing impact) ---
 
-    entity_score = clamp(entity_score, 0, 10)
+    def _req(pillar: str, label: str, ok: bool, detail: str, impact_points: float):
+        return {
+            "pillar": pillar,
+            "label": label,
+            "ok": bool(ok),
+            "detail": detail,
+            "impact_points": float(impact_points),
+        }
 
-    # Content Credibility (0-10)
-    cred_score = 0.0
-    if external_citations >= 3:
-        cred_score += 2.5
-    elif external_citations >= 1:
-        cred_score += 1.0
+    # Build requirements (these MUST match what we show as prioritized actions)
+    requirements = {
+        "Entity Authority": [
+            _req(
+                "Entity Authority",
+                "Business entity schema (Organization eller LocalBusiness)",
+                bool(org_obj) or ("Organization" in clean_schema_types) or ("LocalBusiness" in clean_schema_types),
+                "Tilføj Organization/LocalBusiness JSON-LD med navn, url, logo, kontakt, sameAs.",
+                3.0,
+            ),
+            _req(
+                "Entity Authority",
+                "Kontaktinfo synlig (telefon eller email)",
+                bool(nap_phone or nap_email),
+                "Vis telefon/email tydeligt (fx footer/kontaktsektion) og gerne i schema.",
+                1.0,
+            ),
+            _req(
+                "Entity Authority",
+                "Adresse/servicebase synlig",
+                bool(nap_address),
+                "Tilføj adresse eller tydelig base + serviceområde.",
+                1.0,
+            ),
+            _req(
+                "Entity Authority",
+                "CVR synlig",
+                bool(nap_cvr),
+                "Vis CVR i footer/kontakt (og gerne i schema).",
+                1.0,
+            ),
+            _req(
+                "Entity Authority",
+                "Min. 2 sociale profiler / sameAs links",
+                len(socials) >= 2,
+                "Tilføj Facebook/LinkedIn/Instagram + evt. Trustpilot i sameAs.",
+                1.5,
+            ),
+            _req(
+                "Entity Authority",
+                "Om os-side findes (internt link)",
+                bool(has_about),
+                "Tilføj eller link til /om, /om-os, /about-us.",
+                0.8,
+            ),
+            _req(
+                "Entity Authority",
+                "Kontakt-side findes (internt link)",
+                bool(has_contact),
+                "Tilføj eller link til /kontakt.",
+                0.8,
+            ),
+            _req(
+                "Entity Authority",
+                "Forfatter/Person attribution (artikler/guides)",
+                (bool(person_obj or author_visible) if page_type != "Service Page" else True),
+                "Tilføj forfatterboks + Person schema (navn, rolle, credentials, sameAs).",
+                2.5,
+            ),
+        ],
+        "Content Credibility": [
+            _req(
+                "Content Credibility",
+                "Mindst 1 trusted kilde (myndighed/standard/datablad)",
+                len(trusted_out_links) >= 1,
+                "Link til fx myndighed, standard, SDS/datablad, miljømærke, producentdokumentation.",
+                1.5,
+            ),
+            _req(
+                "Content Credibility",
+                "Ekspertudtalelse eller tydelig kilde-attribution",
+                bool(has_expert_quotes),
+                "Tilføj 1–2 korte citater/udtalelser med attribution + link til kilde.",
+                1.0,
+            ),
+            _req(
+                "Content Credibility",
+                "Tilstrækkeligt indhold (≥ 450 ord)",
+                word_count >= 450,
+                "Udbyg med FAQ, metode, materialer, garanti/vilkår, cases, serviceområde.",
+                1.5,
+            ),
+            _req(
+                "Content Credibility",
+                "Proces/arbejdsgang (service-sider)",
+                (bool(has_process) if page_type == "Service Page" else True),
+                "Beskriv 3–6 trin (forberedelse → udførelse → efterbehandling).",
+                1.0,
+            ),
+            _req(
+                "Content Credibility",
+                "Pris-/fra-pris signal (service-sider)",
+                (bool(has_pricing) if page_type == "Service Page" else True),
+                "Tilføj fra-pris, priseksempler eller hvad der påvirker prisen.",
+                0.8,
+            ),
+            _req(
+                "Content Credibility",
+                "Serviceområde tydeligt (service-sider)",
+                (bool(has_service_area) if page_type == "Service Page" else True),
+                "Tilføj byer/regioner eller 'Hele Danmark' + evt. liste over områder.",
+                0.7,
+            ),
+        ],
+        "Technical Signals": [
+            _req(
+                "Technical Signals",
+                "Schema markup findes (mindst 1 type)",
+                bool(clean_schema_types),
+                "Tilføj mindst business entity + relevant side-type schema.",
+                2.0,
+            ),
+            _req(
+                "Technical Signals",
+                "Service schema (service-sider)",
+                (bool("Service" in clean_schema_types) if page_type == "Service Page" else True),
+                "Tilføj Service JSON-LD pr. ydelse og link provider til Organization/@id.",
+                3.0,
+            ),
+            _req(
+                "Technical Signals",
+                "FAQPage schema når FAQ-indhold findes",
+                (bool("FAQPage" in clean_schema_types) if has_faq_like else True),
+                "Markér Q&A som FAQPage schema.",
+                0.8,
+            ),
+            _req(
+                "Technical Signals",
+                "Canonical link findes",
+                bool(has_canonical),
+                "Tilføj rel=canonical.",
+                0.6,
+            ),
+            _req(
+                "Technical Signals",
+                "Meta description findes",
+                bool(meta_desc),
+                "Tilføj unik meta description (140–160 tegn).",
+                0.4,
+            ),
+            _req(
+                "Technical Signals",
+                "Privacy/cookie-link findes (internt link)",
+                bool(has_privacy),
+                "Tilføj link til cookie-/privatlivspolitik i footer.",
+                0.8,
+            ),
+            _req(
+                "Technical Signals",
+                "Indexability OK (ikke noindex/robots/HTTP-fejl)",
+                not is_blocked,
+                "Fjern noindex, ret robots.txt, og sørg for 200 OK.",
+                3.0,
+            ),
+        ],
+    }
 
-    # Don't reward claims; punish if claims exist and no citations
-    if unsourced_claims and external_citations == 0:
-        cred_score -= 1.0
+    def _pillar_score(reqs) -> float:
+        missing_points = sum(r["impact_points"] for r in reqs if not r["ok"])
+        return clamp(10.0 - missing_points, 0.0, 10.0)
 
-    if len(trusted_out_links) >= 1:
-        cred_score += 1.5
-
-    # Expert quote heuristic (basic)
-    has_expert_quotes = bool(re.search(r"\b(siger|udtaler|ifølge|citat|kilde:)\b", text, re.I))
-    if has_expert_quotes:
-        cred_score += 1.5
-
-    # Service-page helpfulness
-    if page_type == "Service Page" and has_process:
-        cred_score += 1.0
-    if page_type == "Service Page" and has_pricing:
-        cred_score += 1.0
-    if h2_count >= 3:
-        cred_score += 0.5
-
-    # Guarantee only helps if terms exist
-    if has_guarantee and has_terms:
-        cred_score += 0.5
-
-    # Thin content penalty
-    if word_count < 450:
-        cred_score -= 1.0
-    elif word_count < 700:
-        cred_score -= 0.3
-
-    cred_score = clamp(cred_score, 0, 10)
-
-    # Technical Signals (0-10)
-    tech_score = 0.0
-    if clean_schema_types:
-        tech_score += 2.0
-    if page_type == "Service Page" and "Service" in clean_schema_types:
-        tech_score += 2.5
-    if ("Organization" in clean_schema_types) or ("LocalBusiness" in clean_schema_types):
-        tech_score += 2.0
-    if reviews_mentioned and has_review_schema:
-        tech_score += 1.5
-    if has_h1:
-        tech_score += 1.0
-    if meta_desc:
-        tech_score += 0.5
-    if has_canonical:
-        tech_score += 0.5
-    if has_privacy:
-        tech_score += 0.5
-
-    tech_score = clamp(tech_score, 0, 10)
+    entity_score = _pillar_score(requirements["Entity Authority"])
+    cred_score   = _pillar_score(requirements["Content Credibility"])
+    tech_score   = _pillar_score(requirements["Technical Signals"])
 
     overall = round(0.35 * entity_score + 0.35 * cred_score + 0.30 * tech_score, 1)
 
     # --- 4) Findings (more specific, less repetitive) ---
+    # INDEXABILITY (highest priority)
+    if is_blocked:
+        reasons_txt = index_reasons or "Unknown"
+        findings.append(
+            Finding(
+                "Technical Signals",
+                "Critical",
+                "Siden kan ikke indekseres (indexability issue)",
+                "Hvis siden er noindex/blokeret eller ikke kan hentes stabilt, er alt andet sekundært.",
+                "Fjern noindex (meta/X-Robots-Tag), ret robots.txt-regler, og sørg for at URL svarer 200.",
+                5,
+                10,
+                evidence=f"Indexability: {index_label} • {reasons_txt}",
+            )
+        )
     # ENTITY
     if not org_obj and not (nap_phone or nap_email):
         sev = "Critical" if page_type == "Service Page" else "High"
@@ -925,23 +1847,6 @@ def score_and_findings(
             evidence="Ingen <link rel='canonical'> fundet."
         ))
 
-    if page_type == "Service Page" and "Service" not in clean_schema_types:
-        findings.append(Finding(
-            "Technical Signals", "Critical",
-            "Mangler Service schema på serviceside",
-            "AI forstår ikke fuldt ud at dette er en ydelse, og hvordan den relaterer til udbyderen.",
-            "Tilføj Service JSON-LD pr. ydelse og link provider til Organization/@id.",
-            5, 30,
-            evidence="Page type = Service Page, men Service schema er ikke fundet.",
-            snippet=json.dumps({
-                "@context": "https://schema.org",
-                "@type": "Service",
-                "serviceType": "Fliserens",
-                "provider": {"@id": "https://eksempel.dk/#organization"},
-                "areaServed": {"@type": "Country", "name": "Denmark"}
-            }, ensure_ascii=False, indent=2)
-        ))
-
     if reviews_mentioned and not has_review_schema:
         findings.append(Finding(
             "Technical Signals", "High",
@@ -959,26 +1864,6 @@ def score_and_findings(
             }, ensure_ascii=False, indent=2)
         ))
 
-    if page_type == "Service Page" and has_faq_like and "FAQPage" not in clean_schema_types:
-        findings.append(Finding(
-            "Technical Signals", "Medium",
-            "FAQ-indhold uden FAQPage schema",
-            "Hvis du allerede har FAQ-lignende indhold, kan schema give bedre udtræk til AI.",
-            "Markér Q&A som FAQPage schema.",
-            3, 25,
-            evidence="FAQ-signaler fundet (FAQ/spørgsmål/?) men ingen FAQPage schema."
-        ))
-
-    if not has_privacy:
-        findings.append(Finding(
-            "Technical Signals", "Low",
-            "Ingen tydelig privacy/cookie-side fundet i interne links",
-            "Det er et trust-signal at have synlig GDPR/cookie/privatliv (især i EU).",
-            "Tilføj link til cookie-/privatlivspolitik i footer.",
-            2, 15,
-            evidence="Ingen interne links der matcher privacy/cookie/gdpr."
-        ))
-
     # Sortering
     sev_rank = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
     findings.sort(key=lambda f: (sev_rank.get(f.severity, 9), -f.impact, f.effort_minutes))
@@ -986,6 +1871,19 @@ def score_and_findings(
     # --- 5) Entity map ---
     nodes: List[Dict[str, Any]] = [{"id": "page", "label": "WebPage", "type": "Page", "color": "#e2e8f0"}]
     edges: List[Dict[str, Any]] = []
+    product_signals = {}
+    try:
+        product_signals = extract_product_signals(
+            html=raw_html or "",
+            final_url=final_url or (meta.get("og:url") or ""),
+            title=title,
+            headings=headings,
+            meta=meta,
+            schema_objs=schema_objs,
+            text=text,
+        )
+    except Exception:
+        product_signals = {}
 
     if org_obj:
         name = str(org_obj.get("name") or "Organization")
@@ -993,7 +1891,7 @@ def score_and_findings(
         edges.append({"from": "org", "to": "page", "rel": "publishes"})
     else:
         nodes.append({"id": "miss_org", "label": "Organization?", "type": "Missing", "style": "dashed", "color": "#fecaca"})
-        edges.append({"from": "miss_org", "to": "page", "rel": "missing", "style": "dashed"})
+        edges.append({"from": "miss_org", "to": "page", "rel": "missing", "style": "missing"})
 
     if person_obj:
         pname = str(person_obj.get("name") or "Author")
@@ -1006,11 +1904,54 @@ def score_and_findings(
         edges.append({"from": "txt_auth", "to": "page", "rel": "detected"})
     else:
         nodes.append({"id": "miss_auth", "label": "Author?", "type": "Missing", "style": "dashed", "color": "#fecaca"})
-        edges.append({"from": "miss_auth", "to": "page", "rel": "missing", "style": "dashed"})
+        edges.append({"from": "miss_auth", "to": "page", "rel": "missing", "style": "missing"})
 
     if page_type == "Service Page":
         nodes.append({"id": "service", "label": "Service Offer", "type": "Service", "color": "#dcfce7"})
         edges.append({"from": "page", "to": "service", "rel": "offers"})
+    
+    # Product-centric graph for webshop PDPs
+    if page_type == "Product Page":
+        pname = (product_signals.get("product_name") or "Product").strip() or "Product"
+        brand = (product_signals.get("brand") or "").strip()
+        collection = (product_signals.get("collection") or "").strip()
+        price = (product_signals.get("price") or "").strip()
+        currency = (product_signals.get("currency") or "").strip()
+        availability = (product_signals.get("availability") or "").strip()
+
+        # Core node
+        nodes.append({"id": "product", "label": pname[:60], "type": "Product", "group": "product", "color": "#a7f3d0", "size": 36})
+        edges.append({"from": "page", "to": "product", "rel": "about"})
+
+        if brand:
+            nodes.append({"id": "brand", "label": brand[:50], "type": "Brand", "group": "brand", "color": "#bfdbfe", "size": 24})
+            edges.append({"from": "product", "to": "brand", "rel": "brand"})
+
+        if collection:
+            nodes.append({"id": "collection", "label": collection[:50], "type": "Collection", "group": "collection", "color": "#e9d5ff", "size": 22})
+            edges.append({"from": "product", "to": "collection", "rel": "part_of"})
+
+        has_offer_bits = bool(price or availability or product_signals.get("offers_count"))
+        if has_offer_bits:
+            nodes.append({"id": "offer", "label": "Offer", "type": "Offer", "group": "offer", "color": "#fde68a", "size": 22})
+            edges.append({"from": "product", "to": "offer", "rel": "offers"})
+
+            if price:
+                price_label = price
+                if currency and currency.upper() not in price_label.upper():
+                    price_label = f"{price} {currency.upper()}"
+                nodes.append({"id": "price", "label": price_label[:30], "type": "Price", "group": "price", "color": "#fff7ed", "size": 18})
+                edges.append({"from": "offer", "to": "price", "rel": "price"})
+
+            if availability:
+                nodes.append({"id": "availability", "label": availability[:30], "type": "Availability", "group": "availability", "color": "#f1f5f9", "size": 18})
+                edges.append({"from": "offer", "to": "availability", "rel": "availability"})
+
+        variants = product_signals.get("variants") or []
+        for i, v in enumerate(variants[:6]):
+            vid = f"variant_{i+1}"
+            nodes.append({"id": vid, "label": str(v)[:40], "type": "Variant", "group": "variant", "color": "#dcfce7", "size": 16})
+            edges.append({"from": "product", "to": vid, "rel": "has_variant", "style": "weak"})
 
     cited = []
     for u in ext_links:
@@ -1023,6 +1964,54 @@ def score_and_findings(
         label = re.sub(r"^https?://", "", u).split("/")[0]
         nodes.append({"id": nid, "label": label, "type": "Cited", "color": "#f1f5f9"})
         edges.append({"from": "page", "to": nid, "rel": "cites"})
+
+    # Optional dependency (better entity extraction)
+    try:
+        import spacy  # type: ignore
+    except Exception:
+        spacy = None
+    # --- Topic entities (brands/products/etc.) extracted from content ---
+    # The old map looked "empty" because we only mapped schema + a few cited links.
+    # This adds the missing layer: entities mentioned in the content itself.
+    topics = extract_topic_entities(title=title, headings=headings, text=text, max_entities=18)
+
+    def _safe_node_id(prefix: str, label: str) -> str:
+        base = re.sub(r"[^A-Za-z0-9_]+", "_", label.strip())
+        base = base.strip("_")
+        if not base:
+            base = "x"
+        return f"{prefix}{base[:40]}"
+
+    existing_ids = {n.get("id") for n in nodes if n.get("id")}
+    for ent, c in topics:
+        nid = _safe_node_id("t_", ent)
+        # Ensure uniqueness
+        k = 1
+        while nid in existing_ids:
+            k += 1
+            nid = f"{_safe_node_id('t_', ent)}_{k}"
+        existing_ids.add(nid)
+
+        # Size scaling (bounded) – makes the map feel like the reference screenshot
+        size = int(clamp(12 + (c * 2), 14, 36))
+
+        nodes.append(
+            {
+                "id": nid,
+                "label": ent,
+                "type": "Topic",
+                "group": "topic",
+                "size": size,
+                "color": "#22c55e",
+            }
+        )
+
+        # Connect topics to the main entity if present, otherwise to the page
+        if any(n.get("id") == "product" for n in nodes):
+            hub = "product"
+        else:
+            hub = "org" if any(n.get("id") == "org" for n in nodes) else "page"
+        edges.append({"from": hub, "to": nid, "rel": "mentions", "style": "weak"})
 
     entity_payload = {"nodes": nodes, "edges": edges}
 
@@ -1056,7 +2045,295 @@ def score_and_findings(
         "social_links_count": len(socials),
     }
 
-    return overall, entity_score, cred_score, tech_score, findings, entity_payload, detected
+    # --- 6) To-do list (missing signals) ---
+    def _todo(label: str, ok: bool, detail: str, approx_gain: float = 0.0) -> Dict[str, Any]:
+        return {
+            "label": label,
+            "ok": bool(ok),
+            "detail": detail,
+            "approx_gain": float(approx_gain),  # informational only
+        }
+
+    todo_summary: Dict[str, Any] = {
+        "Entity Authority": {
+            "items": [
+                _todo(
+                    "Business entity schema (Organization eller LocalBusiness)",
+                    bool(org_obj) or ("Organization" in clean_schema_types) or ("LocalBusiness" in clean_schema_types),
+                    "Tilføj Organization/LocalBusiness JSON-LD med navn, url, logo, kontakt, sameAs.",
+                    3.0,
+                ),
+                _todo(
+                    "Kontaktinfo synlig (telefon eller email)",
+                    bool(nap_phone or nap_email),
+                    "Vis telefon/email tydeligt (fx footer/kontaktsektion) og gerne i schema.",
+                    1.0,
+                ),
+                _todo(
+                    "Adresse/servicebase synlig",
+                    bool(nap_address),
+                    "Tilføj adresse eller tydelig base + serviceområde.",
+                    1.0,
+                ),
+                _todo(
+                    "CVR synlig",
+                    bool(nap_cvr),
+                    "Vis CVR i footer/kontakt (og gerne i schema).",
+                    1.0,
+                ),
+                _todo(
+                    "Min. 2 sociale profiler / sameAs links",
+                    len(socials) >= 2,
+                    "Tilføj Facebook/LinkedIn/Instagram + evt. Trustpilot i sameAs.",
+                    1.5,
+                ),
+                _todo(
+                    "Om os-side findes (internt link)",
+                    bool(has_about),
+                    "Tilføj eller link til /om, /om-os, /about-us.",
+                    0.8,
+                ),
+                _todo(
+                    "Kontakt-side findes (internt link)",
+                    bool(has_contact),
+                    "Tilføj eller link til /kontakt.",
+                    0.8,
+                ),
+                _todo(
+                    "Forfatter/Person attribution (artikler/guides)",
+                    (bool(person_obj or author_visible) if page_type != "Service Page" else True),
+                    "Tilføj forfatterboks + Person schema (navn, rolle, credentials, sameAs).",
+                    2.5,
+                ),
+            ]
+        },
+        "Content Credibility": {
+            "items": [
+                _todo(
+                    "Eksterne kilder/citations (≥ 1)",
+                    external_citations >= 1,
+                    "Link til troværdige kilder (metode, materialer, standarder, datablade).",
+                    1.0,
+                ),
+                _todo(
+                    "Eksterne kilder/citations (≥ 3)",
+                    external_citations >= 3,
+                    "3+ citations giver markant stærkere trust.",
+                    2.5,
+                ),
+                _todo(
+                    "Mindst 1 trusted kilde (myndighed/standard/datablad)",
+                    len(trusted_out_links) >= 1,
+                    "Link til fx myndighed, standard, SDS/datablad, miljømærke, producentdokumentation.",
+                    1.5,
+                ),
+                _todo(
+                    "Ekspertudtalelse eller tydelig kilde-attribution",
+                    bool(has_expert_quotes),
+                    "Tilføj 1–2 korte citater/udtalelser med attribution + link til kilde.",
+                    1.5,
+                ),
+                _todo(
+                    "Proces/arbejdsgang (service-sider)",
+                    (bool(has_process) if page_type == "Service Page" else True),
+                    "Beskriv 3–6 trin (forberedelse → udførelse → efterbehandling).",
+                    1.0,
+                ),
+                _todo(
+                    "Pris-/fra-pris signal (service-sider)",
+                    (bool(has_pricing) if page_type == "Service Page" else True),
+                    "Tilføj fra-pris, priseksempler eller hvad der påvirker prisen.",
+                    1.0,
+                ),
+                _todo(
+                    "Tilstrækkeligt indhold (≥ 450 ord)",
+                    word_count >= 450,
+                    "Udbyg med FAQ, metode, materialer, garanti/vilkår, cases, serviceområde.",
+                    1.0,
+                ),
+                _todo(
+                    "Serviceområde tydeligt (service-sider)",
+                    (bool(has_service_area) if page_type == "Service Page" else True),
+                    "Tilføj byer/regioner eller 'Hele Danmark' + evt. liste over områder.",
+                    0.8,
+                ),
+                _todo(
+                    "Før/efter eller målbar dokumentation (service-sider)",
+                    (bool(has_before_after) if page_type == "Service Page" else True),
+                    "Tilføj cases, billeder eller målbar effekt.",
+                    0.5,
+                ),
+                _todo(
+                    "Kontakt-CTA tydelig (service-sider)",
+                    (bool(has_contact_cta) if page_type == "Service Page" else True),
+                    "Tilføj 'Få tilbud', 'Ring', 'Book', 'Kontakt os' + forventet svartid.",
+                    0.5,
+                ),
+            ]
+        },
+        "Technical Signals": {
+            "items": [
+                _todo(
+                    "Schema markup findes (mindst 1 type)",
+                    bool(clean_schema_types),
+                    "Tilføj mindst business entity + relevant side-type schema.",
+                    2.0,
+                ),
+                _todo(
+                    "Service schema (service-sider)",
+                    (("Service" in clean_schema_types) if page_type == "Service Page" else True),
+                    "Tilføj Service JSON-LD og link provider til organization @id.",
+                    2.5,
+                ),
+                _todo(
+                    "Review/AggregateRating schema når anmeldelser nævnes",
+                    (not reviews_mentioned) or bool(has_review_schema),
+                    "Hvis du nævner anmeldelser/stjerner, så markér dem med Review/AggregateRating.",
+                    1.5,
+                ),
+                _todo(
+                    "H1 findes",
+                    bool(has_h1),
+                    "Tilføj en tydelig H1 for siden.",
+                    1.0,
+                ),
+                _todo(
+                    "Meta description findes",
+                    bool(meta_desc),
+                    "Tilføj unik meta description (140–160 tegn).",
+                    0.5,
+                ),
+                _todo(
+                    "Canonical link findes",
+                    bool(has_canonical),
+                    "Tilføj rel=canonical.",
+                    0.5,
+                ),
+                _todo(
+                    "Privacy/cookie-link findes (internt link)",
+                    bool(has_privacy),
+                    "Tilføj link til cookie-/privatlivspolitik i footer.",
+                    0.5,
+                ),
+                _todo(
+                    "FAQPage schema når FAQ-indhold findes",
+                    (not has_faq_like) or ("FAQPage" in clean_schema_types),
+                    "Har du FAQ, så tilføj FAQPage schema.",
+                    0.8,
+                ),
+            ]
+        },
+        "Indexability": {
+            "items": [
+                _todo(
+                    "Ingen noindex (meta/X-Robots-Tag)",
+                    ("noindex" not in parse_robots_directives((meta.get("robots") or ""))) and ("noindex" not in parse_robots_directives((indexability.get("x_robots_tag") or ""))),
+                    "Fjern noindex fra meta robots eller X-Robots-Tag.",
+                    2.0,
+                ),
+                _todo(
+                    "Robots.txt tillader siden",
+                    (indexability.get("robots_txt_allows") is not False),
+                    "Tjek robots.txt (User-agent: *) og fjern disallow for denne URL.",
+                    1.0,
+                ),
+                _todo(
+                    "URL svarer 200 og er ikke blokeret",
+                    ((indexability.get("status") or 0) in (200, 201, 202)) and (not bool((indexability or {}).get("blocked"))),
+                    "Sørg for at siden svarer 200 og ikke er blokeret af robots/noindex.",
+                    3.0,
+                ),
+            ]
+        },
+    }
+
+    # Reduce to only missing items (true to-do list)
+    for _pillar, _data in todo_summary.items():
+        items = _data.get("items") or []
+        missing = [it for it in items if not it.get("ok")]
+        done = [it for it in items if it.get("ok")]
+        _data["missing"] = missing
+        _data["done"] = done
+        _data["missing_count"] = len(missing)
+        _data["done_count"] = len(done)
+    
+    # --- Ensure all missing todo items become prioritized findings (single list in UI) ---
+    def _severity_from_gain(g: float, pillar_name: str, label: str) -> str:
+        g = float(g or 0.0)
+        low_label = (label or "").lower()
+
+        # Indexability is usually high stakes
+        if pillar_name == "Indexability":
+            if any(k in low_label for k in ["noindex", "robots", "200", "bloker", "blocked"]):
+                return "High"
+            return "Medium" if g >= 1.0 else "Low"
+
+        if g >= 2.0:
+            return "High"
+        if g >= 1.0:
+            return "Medium"
+        return "Low"
+
+    def _impact_from_gain(g: float) -> int:
+        g = float(g or 0.0)
+        if g >= 3.0:
+            return 5
+        if g >= 2.0:
+            return 4
+        if g >= 1.0:
+            return 3
+        if g >= 0.8:
+            return 2
+        return 1
+
+    def _already_covered(pillar_name: str, label: str) -> bool:
+        ll = (label or "").strip().lower()
+        for f in findings:
+            if f.pillar != pillar_name:
+                continue
+            t = (f.title or "").strip().lower()
+            if not t:
+                continue
+            if ll in t or t in ll:
+                return True
+        return False
+
+    # Convert missing todo items → findings (if not already covered by an existing finding)
+    for _pillar, _data in (todo_summary or {}).items():
+        for it in (_data.get("missing") or []):
+            label = (it.get("label") or "").strip()
+            detail = (it.get("detail") or "").strip()
+            gain = float(it.get("approx_gain") or 0.0)
+
+            if not label:
+                continue
+            if _already_covered(_pillar, label):
+                continue
+
+            sev = _severity_from_gain(gain, _pillar, label)
+            imp = _impact_from_gain(gain)
+
+            effort = 20
+            if _pillar == "Indexability":
+                effort = 10
+
+            findings.append(
+                Finding(
+                    pillar=_pillar,
+                    severity=sev,
+                    title=label,
+                    why="Dette signal mangler og trækker scoren ned.",
+                    how=detail or "Tilføj/ret dette signal på siden.",
+                    impact=imp,
+                    effort_minutes=effort,
+                    evidence=f"Mangler · ≈ +{gain:.1f}" if gain > 0 else "Mangler",
+                )
+            )
+
+    # Re-sort after injecting missing items
+    findings.sort(key=lambda f: (sev_rank.get(f.severity, 9), -f.impact, f.effort_minutes))
+
+    return overall, entity_score, cred_score, tech_score, findings, entity_payload, detected, todo_summary
 
 
 # ------------------------------------------------------------
@@ -1083,11 +2360,7 @@ with col_input:
         else:
             pasted = st.text_area("Indhold", height=150, placeholder="<html> eller tekst...", label_visibility="collapsed")
 
-        c_opt, c_btn = st.columns([2, 1])
-        with c_opt:
-            use_playwright = st.checkbox("Aktivér Playwright", value=False, help="Brug denne hvis siden blokerer bots")
-        with c_btn:
-            analyze = st.button("Kør Analyse ✨", type="primary", use_container_width=True)
+        analyze = st.button("Kør Analyse ✨", type="primary", use_container_width=True)
 
 if analyze:
     if mode == "URL" and not url.strip():
@@ -1100,27 +2373,26 @@ if analyze:
     with st.spinner("Analyserer signaler..."):
         try:
             if mode == "URL":
-                final_url, html, status, _headers = (
-                    fetch_url_playwright(url) if use_playwright else fetch_url_uncached(url)
-                )
+                final_url, html, status, _headers = fetch_url_uncached(url)
             else:
                 final_url, html, status, _headers = build_from_paste(pasted.strip())
 
             if not html:
-                st.error("Kunne ikke hente indhold. Prøv Playwright eller tjek URL.")
+                st.error("Kunne ikke hente indhold. Tjek URL eller prøv igen.")
                 st.stop()
 
             text, title = extract_main_text_and_title(html)
             headings = extract_headings(html)
             internal_links, ext_links = extract_links(html, base_url=final_url if mode == "URL" else "")
             meta = extract_meta(html)
+            indexability = compute_indexability(final_url if mode == "URL" else "", status, meta, _headers)
             nap = find_nap_signals(html)
 
             jsonld = extract_jsonld(html)
             schema_types, schema_objs = flatten_schema_types(jsonld)
-            page_type = guess_page_type(title, headings, text)
+            page_type = guess_page_type(title, headings, text, url=final_url if mode == "URL" else "", schema_types=schema_types)
 
-            overall, s_ent, s_cred, s_tech, findings, entity_payload, detected = score_and_findings(
+            overall, s_ent, s_cred, s_tech, findings, entity_payload, detected, todo_summary = score_and_findings(
                 page_type=page_type,
                 title=title,
                 text=text,
@@ -1131,6 +2403,9 @@ if analyze:
                 ext_links=ext_links,
                 meta=meta,
                 nap=nap,
+                indexability=indexability,
+                final_url=final_url if mode == "URL" else "",
+                raw_html=html,
             )
         except Exception as e:
             st.error(f"Fejl under analyse: {e}")
@@ -1140,22 +2415,26 @@ if analyze:
     with r_content:
         st.markdown("---")
 
-        c_head1, c_head2, c_head3 = st.columns([1.2, 1, 1.5])
+        c_head2, c_head3, c_head1 = st.columns([1.1, 1, 1.3])
 
         with c_head1:
+            st.markdown('<div class="css-card" style="text-align:center;">', unsafe_allow_html=True)
+            st.caption("AI READINESS")
+            render_donut_score(overall)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with c_head2:
             st.markdown('<div class="css-card">', unsafe_allow_html=True)
             st.caption("PAGE TYPE")
             st.markdown(f"### {page_type}")
             if page_type == "Service Page":
                 st.caption("• Focus: Service Provider Entity, Schema Markup, Location, Purchase Signals")
-            else:
+            elif page_type == "Product Page":
+                st.caption("• Focus: Product Entity, Offer, Price/Availability, Reviews")
+            elif page_type == "Content / Article":
                 st.caption("• Focus: Author Authority, Expertise, Citations")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        with c_head2:
-            st.markdown('<div class="css-card" style="text-align:center;">', unsafe_allow_html=True)
-            st.caption("AI READINESS")
-            render_donut_score(overall)
+            else:
+                st.caption("• Focus: Entity signals, basic trust, technical hygiene")
             st.markdown('</div>', unsafe_allow_html=True)
 
         with c_head3:
@@ -1190,6 +2469,12 @@ if analyze:
             if page_type == "Service Page":
                 if not has_service:
                     missing_items.append("Service")
+            elif page_type == "Product Page":
+                # Product pages should have Product + Offer (and ideally reviews when present)
+                if "Product" not in found_set:
+                    missing_items.append("Product")
+                if "Offer" not in found_set:
+                    missing_items.append("Offer")
             else:
                 # For non-service pages we only require Person if the page is content/article-like
                 if page_type == "Content / Article" and not has_person:
@@ -1214,6 +2499,7 @@ if analyze:
             )
             st.markdown("</div>", unsafe_allow_html=True)
 
+
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown('<div class="css-card" style="text-align:center;">', unsafe_allow_html=True)
@@ -1232,15 +2518,43 @@ if analyze:
             st.markdown("</div>", unsafe_allow_html=True)
 
         wins = quick_wins(findings)
+
+        # --- Quick Wins section (before Detected Signals expander) ---
         if wins:
-            st.info(f"⚡ **{len(wins)} Quick Wins** identified! See details below.")
-        
+            st.markdown("## ⚡ Quick Wins")
+            st.caption("Høj effekt, lav indsats – prioriter disse først")
+
+            for i, w in enumerate(wins, start=1):
+                with st.container(border=True):
+                    st.markdown(
+                        f"**{i}. {w.title}**  \n"
+                        f"<span class='badge badge-{w.severity}'>{w.severity}</span> "
+                        f"Impact: <b>{w.impact}/5</b> • Tid: <b>{w.effort_minutes} min</b>",
+                        unsafe_allow_html=True,
+                    )
+                    st.write(w.why)
+                    st.markdown("**Forslag:**")
+                    st.write(w.how)
+                    if w.evidence:
+                        st.caption(f"Evidence: {w.evidence}")
+
         # Detected Signals (so you can verify the analysis is not generic)
         with st.expander("🔎 Detected Signals"):
             st.json(detected)
+            st.caption(
+                f"To-do counts — Entity: {(todo_summary.get('Entity Authority', {}).get('missing_count') if todo_summary else 0)} · "
+                f"Credibility: {(todo_summary.get('Content Credibility', {}).get('missing_count') if todo_summary else 0)} · "
+                f"Technical: {(todo_summary.get('Technical Signals', {}).get('missing_count') if todo_summary else 0)} · "
+                f"Indexability: {(todo_summary.get('Indexability', {}).get('missing_count') if todo_summary else 0)}"
+            )
 
         st.subheader("📋 Detaljeret Rapport")
-        tab1, tab2, tab3 = st.tabs(["🏛️ Entity Authority", "📚 Content Credibility", "⚙️ Technical Signals"])
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "🏛️ Entity Authority",
+            "📚 Content Credibility",
+            "⚙️ Technical Signals",
+            "🧭 Indexability",
+        ])
 
         def render_findings_list(target_pillar: str):
             fs = [f for f in findings if f.pillar == target_pillar]
@@ -1248,47 +2562,85 @@ if analyze:
                 st.success("✅ Ingen problemer fundet.")
                 return
 
+            sev_icon = {
+                "Critical": "🟥",
+                "High": "🟧",
+                "Medium": "🟨",
+                "Low": "🟩",
+            }
+
             for f in fs:
-                with st.expander(f"{f.title}"):
+                # Card header so severity is visible without opening details
+                with st.container(border=True):
+                    icon = sev_icon.get(f.severity, "⬜")
                     st.markdown(
-                        f'<span class="badge badge-{f.severity}">{f.severity}</span> '
-                        f'Impact: <b>{f.impact}/5</b> • Tid: <b>{f.effort_minutes} min</b>',
+                        f"{icon} <span class='badge badge-{f.severity}'>{f.severity}</span> "
+                        f"<b>{f.title}</b> &nbsp;·&nbsp; "
+                        f"Impact: <b>{f.impact}/5</b> &nbsp;·&nbsp; Tid: <b>{f.effort_minutes} min</b>",
                         unsafe_allow_html=True,
                     )
-                    st.markdown("---")
 
-                    c1, c2 = st.columns([1.2, 1])
-                    with c1:
-                        st.markdown("#### PROBLEM")
-                        st.write(f.why)
-                        st.markdown("#### LØSNING")
-                        st.write(f.how)
-                        if f.evidence:
-                            st.caption(f"Evidence: {f.evidence}")
+                    with st.expander("Se detaljer"):
+                        st.markdown("---")
 
-                    with c2:
-                        if f.snippet:
-                            st.markdown("#### 💻 COPY/PASTE KODE")
-                            st.code(f.snippet, language="json")
-                        else:
-                            st.info("Ingen kode-snippet nødvendig.")
+                        c1, c2 = st.columns([1.2, 1])
+                        with c1:
+                            st.markdown("#### PROBLEM")
+                            st.write(f.why)
+                            st.markdown("#### LØSNING")
+                            st.write(f.how)
+                            if f.evidence:
+                                st.caption(f"Evidence: {f.evidence}")
+
+                        with c2:
+                            if f.snippet:
+                                st.markdown("#### 💻 COPY/PASTE KODE")
+                                st.code(f.snippet, language="json")
+                            else:
+                                st.info("Ingen kode-snippet nødvendig.")
 
         with tab1:
             render_findings_list("Entity Authority")
+
         with tab2:
             render_findings_list("Content Credibility")
+
         with tab3:
             render_findings_list("Technical Signals")
 
+        with tab4:
+            st.subheader("🧭 Indexability & Crawlability")
+
+            label = indexability.get("label") or "Uncertain"
+            blocked = bool(indexability.get("blocked"))
+            reasons = indexability.get("blocked_reasons") or []
+
+            if blocked:
+                st.error(f"❌ {label}")
+                if reasons:
+                    st.markdown("**Årsager:**")
+                    for r in reasons:
+                        st.markdown(f"- {r}")
+                st.markdown(
+                    "Når en side ikke kan indekseres, ignorerer AI og søgemaskiner "
+                    "ofte størstedelen af øvrige signaler."
+                )
+            else:
+                st.success(f"✅ {label}")
+                st.markdown("Ingen blokerende signaler (noindex, robots.txt eller HTTP-fejl) blev fundet.")
+
+            st.markdown("---")
+            st.markdown("**Tekniske signaler tjekket:**")
+            st.markdown(
+                "- HTTP-statuskode\n"
+                "- meta robots\n"
+                "- X-Robots-Tag headers\n"
+                "- robots.txt (User-agent: *)"
+            )
+
         st.subheader("🕸️ Entity Relationship Map")
         with st.container(border=True):
-            cm1, cm2 = st.columns([1, 3])
-            with cm1:
-                st.write("Visualisering af hvad AI 'ser'.")
-                st.markdown("- **Solid linje:** Fundet (godt)")
-                st.markdown("- **Stiplet/Rød:** Mangler (kritisk)")
-            with cm2:
-                render_graphviz_map(entity_payload)
+            render_entity_map(entity_payload)
 
         st.markdown("---")
         st.subheader("💻 Schema Templates")
@@ -1317,6 +2669,7 @@ if analyze:
                     "Links Out": len(ext_links),
                     "Found Schema": schema_types,
                     "Status": status,
+                    "Indexability": indexability,
                     "Meta": meta,
                     "NAP": nap,
                 }
