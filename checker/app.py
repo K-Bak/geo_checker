@@ -1373,13 +1373,53 @@ def schema_snippet_suggestions(page_type: str) -> Dict[str, str]:
         "sameAs": ["[LinkedIn URL]"],
     }
 
+    webpage = {
+        "@context": "https://schema.org",
+        "@type": "WebPage",
+        "name": "[Sidens titel]",
+        "url": "[https://eksempel.dk/denne-side]",
+        "isPartOf": {"@id": "[https://eksempel.dk/#website]"},
+        "about": "[Kort emne/ydelse]",
+        "primaryImageOfPage": "[https://eksempel.dk/billede.jpg]",
+    }
+
+    creativework = {
+        "@context": "https://schema.org",
+        "@type": "CreativeWork",
+        "headline": "[Titel]",
+        "description": "[Kort beskrivelse]",
+        "url": "[https://eksempel.dk/denne-side]",
+        "datePublished": "2025-01-01",
+        "dateModified": "2025-01-01",
+        "author": {"@type": "Person", "name": "[Navn]"},
+        "publisher": {"@type": "Organization", "name": "[Virksomhedsnavn]"},
+    }
+
+    sitenav = {
+        "@context": "https://schema.org",
+        "@type": "SiteNavigationElement",
+        "name": ["[Menu punkt 1]", "[Menu punkt 2]", "[Menu punkt 3]"],
+        "url": ["[https://eksempel.dk/side-1]", "[https://eksempel.dk/side-2]", "[https://eksempel.dk/side-3]"]
+    }
+
     out = {
         "Organization": json.dumps(org, ensure_ascii=False, indent=2),
         "LocalBusiness": json.dumps(local, ensure_ascii=False, indent=2),
         "Person": json.dumps(person, ensure_ascii=False, indent=2),
+        "WebPage": json.dumps(webpage, ensure_ascii=False, indent=2),
+        "CreativeWork": json.dumps(creativework, ensure_ascii=False, indent=2),
+        "SiteNavigationElement": json.dumps(sitenav, ensure_ascii=False, indent=2),
     }
     if page_type == "Service Page":
         out["Service"] = json.dumps(service, ensure_ascii=False, indent=2)
+
+    # Keep suggestions relevant-ish
+    if page_type == "Content / Article":
+        # CreativeWork is relevant; WebPage can stay
+        pass
+    elif page_type == "Service Page":
+        # Service is already included above; keep WebPage as optional
+        pass
     return out
 
 
@@ -1419,6 +1459,12 @@ def score_and_findings(
     author_visible = bool(re.search(r"\b(forfatter|skrevet af|author|by)\b", text, re.I))
 
     clean_schema_types = [norm_schema_type(t) for t in schema_types]
+    has_webpage_schema = ("WebPage" in clean_schema_types)
+    has_creativework_schema = ("CreativeWork" in clean_schema_types) or ("Article" in clean_schema_types) or ("BlogPosting" in clean_schema_types)
+    has_sitenav_schema = ("SiteNavigationElement" in clean_schema_types)
+
+    raw_html_low = (raw_html or "").lower()
+    has_nav_dom = ("<nav" in raw_html_low) or ("role=\"navigation\"" in raw_html_low) or ("role='navigation'" in raw_html_low)
     has_review_schema = ("Review" in clean_schema_types) or ("AggregateRating" in clean_schema_types)
     reviews_mentioned = ("trustpilot" in text.lower()) or ("anmeldelse" in text.lower()) or ("stjerner" in text.lower())
 
@@ -1449,9 +1495,66 @@ def score_and_findings(
     has_guarantee_years = bool(re.search(r"\b\d+\s*års\s*garanti\b", text, re.I))
     has_terms = bool(re.search(r"\b(gælder|forudsætter|vilkår|betingelser|undtaget|dokumentation)\b", text, re.I))
 
+    # -----------------
+    # USP detection (service-focused)
+    # -----------------
+    def detect_usps(txt: str) -> Dict[str, Any]:
+        t = (txt or "")
+        tl = t.lower()
+
+        years = None
+        m = re.search(r"\b(\d{1,2})\s*\+?\s*(?:års?|aar)\s+(?:erfaring|brancheerfaring)\b", tl)
+        if m:
+            try:
+                years = int(m.group(1))
+            except Exception:
+                years = None
+
+        specialist = bool(re.search(r"\b(specialist(?:er)?\s+i|specialiseret\s+i|ekspert(?:er)?\s+i)\b", tl))
+        authorization = bool(re.search(r"\b(autoriseret|certificeret|godkendt\s+værksted|vvs-autoriseret|el-autoriseret)\b", tl))
+        awards = bool(re.search(r"\b(prisvindende|award|udmærkelse|kåret\s+som|vinder\s+af)\b", tl))
+
+        # Review/star claims (on-page text)
+        star_claim = bool(re.search(r"\b(\d(?:[\.,]\d)?\s*/\s*5|\d(?:[\.,]\d)?\s*ud\s*af\s*5|5\s*-?\s*stjern(?:er|ede)|\d\s*stjerner)\b", tl))
+
+        # Guarantee as USP (separate from 'terms')
+        guarantee_claim = has_guarantee
+
+        usp_flags = {
+            "years_experience": years,
+            "has_specialist": specialist,
+            "has_authorization": authorization,
+            "has_awards": awards,
+            "has_star_claim": star_claim,
+            "has_guarantee": guarantee_claim,
+        }
+        usp_count = sum(
+            1
+            for k, v in usp_flags.items()
+            if (k == "years_experience" and isinstance(v, int) and v >= 5) or (k != "years_experience" and bool(v))
+        )
+        usp_flags["usp_count"] = usp_count
+        return usp_flags
+
+    usps = detect_usps(text)
+    usp_count = int(usps.get("usp_count") or 0)
+
     # Evidence links quality (simple)
     high_trust_domains = ("mst.dk", "miljo", "miljø", "ds.dk", "iso.org", "ecolabel", "svanemaerket", "svanemærket", "sikkerhedsdatablad", "sds")
     trusted_out_links = [u for u in ext_links if any(k in u.lower() for k in high_trust_domains)]
+
+    # -----------------
+    # Review platform signals (Trustpilot vs Google)
+    # -----------------
+    ext_low = [u.lower() for u in (ext_links or [])]
+    has_trustpilot_link = any("trustpilot" in u for u in ext_low)
+    has_google_reviews_link = any(
+        ("google.com/maps" in u) or ("g.page" in u) or ("googleusercontent" in u)
+        for u in ext_low
+    )
+
+    # Schema review signals already tracked via Review/AggregateRating
+    has_review_platform_signal = bool(has_trustpilot_link or has_google_reviews_link or has_review_schema or reviews_mentioned)
 
     # Expert quotes / attribution (simple heuristic)
     # Used by requirements + findings. We treat either explicit attribution language
@@ -1579,6 +1682,20 @@ def score_and_findings(
             ),
             _req(
                 "Content Credibility",
+                "USP'er tydelige (min. 2 stærke USP-signaler)",
+                (usp_count >= 2 if page_type == "Service Page" else True),
+                "Tilføj en kort USP-blok (fx '+15 års erfaring', 'Autoriseret', 'Specialister i X', '5-stjernede anmeldelser', 'Garanti') tæt på hero/CTA.",
+                1.2,
+            ),
+            _req(
+                "Content Credibility",
+                "Anmeldelser signal (Trustpilot/Google eller schema)",
+                (has_review_platform_signal if page_type == "Service Page" else True),
+                "Vis anmeldelser (Trustpilot/Google) med link eller strukturer dem (AggregateRating/Review).",
+                1.0,
+            ),
+            _req(
+                "Content Credibility",
                 "Serviceområde tydeligt (service-sider)",
                 (bool(has_service_area) if page_type == "Service Page" else True),
                 "Tilføj byer/regioner eller 'Hele Danmark' + evt. liste over områder.",
@@ -1592,6 +1709,27 @@ def score_and_findings(
                 bool(clean_schema_types),
                 "Tilføj mindst business entity + relevant side-type schema.",
                 2.0,
+            ),
+            _req(
+                "Technical Signals",
+                "WebPage schema (grundmarkup)",
+                bool(has_webpage_schema),
+                "Tilføj WebPage JSON-LD (name, url, isPartOf) for at gøre sidetypen tydelig for AI.",
+                0.7,
+            ),
+            _req(
+                "Technical Signals",
+                "CreativeWork/Article schema (artikler/guides)",
+                (bool(has_creativework_schema) if page_type == "Content / Article" else True),
+                "Tilføj CreativeWork/Article JSON-LD med headline, author, publisher, datoer.",
+                0.9,
+            ),
+            _req(
+                "Technical Signals",
+                "SiteNavigationElement schema (når navigation findes)",
+                (bool(has_sitenav_schema) if has_nav_dom else True),
+                "Tilføj SiteNavigationElement JSON-LD for at gøre hovednavigationen maskinlæsbar.",
+                0.5,
             ),
             _req(
                 "Technical Signals",
@@ -1756,6 +1894,36 @@ def score_and_findings(
             evidence="Garanti fundet, men ingen vilkårs-ord (gælder/forudsætter/vilkår/betingelser/undtaget) fundet."
         ))
 
+    # USP block missing (service pages)
+    if page_type == "Service Page" and usp_count < 2:
+        findings.append(
+            Finding(
+                "Content Credibility",
+                "Medium",
+                "USP'er ikke tydelige",
+                "Uden klare USP'er bliver siden generisk, og AI har svært ved at forstå hvorfor kunden skal vælge jer.",
+                "Tilføj en kort USP-blok (3–6 bullets) tæt på toppen: erfaring, specialisme, autorisationer, anmeldelser, garanti.",
+                3,
+                15,
+                evidence=f"USP-signaler fundet: {usp_count} (mål: ≥ 2)",
+            )
+        )
+
+    # Reviews: split by platform signals
+    if page_type == "Service Page" and not (has_trustpilot_link or has_google_reviews_link or has_review_schema):
+        findings.append(
+            Finding(
+                "Content Credibility",
+                "Medium",
+                "Anmeldelser ikke tydeligt dokumenteret (Trustpilot/Google)",
+                "Anmeldelser er et stærkt trust-signal, især lokalt. Hvis de kun nævnes uden link eller schema, mister AI det.",
+                "Tilføj link til Trustpilot og/eller Google anmeldelser (GBP) og/eller implementér AggregateRating/Review schema.",
+                3,
+                20,
+                evidence="Ingen Trustpilot/Google review-link og ingen Review/AggregateRating schema fundet.",
+            )
+        )
+
     if page_type == "Service Page" and not has_pricing:
         findings.append(Finding(
             "Content Credibility", "Medium",
@@ -1835,6 +2003,39 @@ def score_and_findings(
             "Tilføj unik meta description (140–160 tegn) med ydelse + område + proof.",
             2, 10,
             evidence="Ingen <meta name='description'> fundet."
+        ))
+
+    if not has_webpage_schema:
+        findings.append(Finding(
+            "Technical Signals", "Low",
+            "WebPage schema mangler",
+            "WebPage markup hjælper AI med at forstå sidens rolle og kontekst.",
+            "Tilføj WebPage JSON-LD (name, url, isPartOf).",
+            2, 15,
+            evidence="Schema types fundet, men ingen WebPage type.",
+            snippet=schema_snippet_suggestions(page_type).get("WebPage")
+        ))
+
+    if page_type == "Content / Article" and not has_creativework_schema:
+        findings.append(Finding(
+            "Technical Signals", "Medium",
+            "CreativeWork/Article schema mangler (indholdsside)",
+            "På guides/artikler øger CreativeWork/Article markup læsbarhed og troværdighed for AI.",
+            "Tilføj CreativeWork/Article JSON-LD med author, publisher, datoer.",
+            3, 25,
+            evidence="Content/Article side uden CreativeWork/Article schema.",
+            snippet=schema_snippet_suggestions(page_type).get("CreativeWork")
+        ))
+
+    if has_nav_dom and not has_sitenav_schema:
+        findings.append(Finding(
+            "Technical Signals", "Low",
+            "SiteNavigationElement schema mangler",
+            "Når navigation findes i DOM, kan schema gøre den mere maskinlæsbar.",
+            "Tilføj SiteNavigationElement JSON-LD (navne + URLs for hovedmenu).",
+            2, 20,
+            evidence="<nav> fundet i HTML, men SiteNavigationElement schema ikke fundet.",
+            snippet=schema_snippet_suggestions(page_type).get("SiteNavigationElement")
         ))
 
     if not has_canonical:
@@ -2043,6 +2244,14 @@ def score_and_findings(
             "cvr": nap.get("cvr"),
         },
         "social_links_count": len(socials),
+        "usp_count": usp_count,
+        "usp_years_experience": usps.get("years_experience"),
+        "usp_specialist": bool(usps.get("has_specialist")),
+        "usp_authorization": bool(usps.get("has_authorization")),
+        "usp_awards": bool(usps.get("has_awards")),
+        "usp_star_claim": bool(usps.get("has_star_claim")),
+        "review_trustpilot_link": bool(has_trustpilot_link),
+        "review_google_link": bool(has_google_reviews_link),
     }
 
     # --- 6) To-do list (missing signals) ---
