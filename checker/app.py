@@ -1766,11 +1766,29 @@ def score_and_findings(
                 "Tilføj link til cookie-/privatlivspolitik i footer.",
                 0.8,
             ),
+            # Removed: Indexability OK (ikke noindex/robots/HTTP-fejl)
+        ],
+        "Indexability": [
             _req(
-                "Technical Signals",
-                "Indexability OK (ikke noindex/robots/HTTP-fejl)",
-                not is_blocked,
-                "Fjern noindex, ret robots.txt, og sørg for 200 OK.",
+                "Indexability",
+                "Ingen noindex (meta/X-Robots-Tag)",
+                ("noindex" not in parse_robots_directives((meta.get("robots") or "")))
+                and ("noindex" not in parse_robots_directives((indexability.get("x_robots_tag") or ""))),
+                "Fjern noindex fra meta robots eller X-Robots-Tag.",
+                3.0,
+            ),
+            _req(
+                "Indexability",
+                "Robots.txt tillader siden",
+                (indexability.get("robots_txt_allows") is not False),
+                "Tjek robots.txt (User-agent: *) og fjern disallow for denne URL.",
+                1.5,
+            ),
+            _req(
+                "Indexability",
+                "URL svarer 200 og er ikke blokeret",
+                ((indexability.get("status") or 0) in (200, 201, 202)) and (not bool((indexability or {}).get("blocked"))),
+                "Sørg for at siden svarer 200 og ikke er blokeret af robots/noindex.",
                 3.0,
             ),
         ],
@@ -1783,8 +1801,10 @@ def score_and_findings(
     entity_score = _pillar_score(requirements["Entity Authority"])
     cred_score   = _pillar_score(requirements["Content Credibility"])
     tech_score   = _pillar_score(requirements["Technical Signals"])
+    index_score  = _pillar_score(requirements["Indexability"])
 
-    overall = round(0.35 * entity_score + 0.35 * cred_score + 0.30 * tech_score, 1)
+    # Overall: keep pillars visible and avoid "Indexability" being counted twice.
+    overall = round(0.30 * entity_score + 0.30 * cred_score + 0.25 * tech_score + 0.15 * index_score, 1)
 
     # --- 4) Findings (more specific, less repetitive) ---
     # INDEXABILITY (highest priority)
@@ -1894,55 +1914,6 @@ def score_and_findings(
             evidence="Garanti fundet, men ingen vilkårs-ord (gælder/forudsætter/vilkår/betingelser/undtaget) fundet."
         ))
 
-    # USP block missing (service pages)
-    if page_type == "Service Page" and usp_count < 2:
-        findings.append(
-            Finding(
-                "Content Credibility",
-                "Medium",
-                "USP'er ikke tydelige",
-                "Uden klare USP'er bliver siden generisk, og AI har svært ved at forstå hvorfor kunden skal vælge jer.",
-                "Tilføj en kort USP-blok (3–6 bullets) tæt på toppen: erfaring, specialisme, autorisationer, anmeldelser, garanti.",
-                3,
-                15,
-                evidence=f"USP-signaler fundet: {usp_count} (mål: ≥ 2)",
-            )
-        )
-
-    # Reviews: split by platform signals
-    if page_type == "Service Page" and not (has_trustpilot_link or has_google_reviews_link or has_review_schema):
-        findings.append(
-            Finding(
-                "Content Credibility",
-                "Medium",
-                "Anmeldelser ikke tydeligt dokumenteret (Trustpilot/Google)",
-                "Anmeldelser er et stærkt trust-signal, især lokalt. Hvis de kun nævnes uden link eller schema, mister AI det.",
-                "Tilføj link til Trustpilot og/eller Google anmeldelser (GBP) og/eller implementér AggregateRating/Review schema.",
-                3,
-                20,
-                evidence="Ingen Trustpilot/Google review-link og ingen Review/AggregateRating schema fundet.",
-            )
-        )
-
-    if page_type == "Service Page" and not has_pricing:
-        findings.append(Finding(
-            "Content Credibility", "Medium",
-            "Ingen pris-/fra-pris signaler",
-            "Uden prisindikatorer bliver siden mere 'brochure' end købbar ydelse.",
-            "Tilføj 'fra-pris', priseksempler eller hvad der påvirker prisen (areal, tilstand, adgang, osv.).",
-            3, 20,
-            evidence="Ingen 'pris/fra xx kr/dkk/kr.' fundet i tekst."
-        ))
-
-    if page_type == "Service Page" and not has_process:
-        findings.append(Finding(
-            "Content Credibility", "Medium",
-            "Proces/arbejdsgang ikke tydelig",
-            "AI forstår og stoler mere på ydelser med konkret metode og trin.",
-            "Tilføj 3–6 trin: forberedelse → udførelse → efterbehandling + tid/forbehold.",
-            3, 25,
-            evidence="Ingen proces-/trin-signal fundet (proces/trin/step/sådan foregår)."
-        ))
 
     if page_type == "Service Page" and not has_before_after:
         findings.append(Finding(
@@ -1954,35 +1925,8 @@ def score_and_findings(
             evidence="Ingen 'før og efter' signal fundet."
         ))
 
-    if not has_expert_quotes:
-        findings.append(Finding(
-            "Content Credibility", "Medium",
-            "Ingen ekspertudtalelser/kilder fundet",
-            "AI vægter indhold højere, når det understøttes af fagpersoner eller dokumenterede kilder.",
-            "Indsæt 1–2 korte citater med attribution + link til kilde (producent, myndighed, standard, SDS).",
-            3, 30,
-            evidence="Ingen 'ifølge/siger/udtaler/citat/kilde:' fundet."
-        ))
 
-    if word_count < 450:
-        findings.append(Finding(
-            "Content Credibility", "High",
-            "Tyndt indhold (lav tekstmængde)",
-            "Korte servicesider giver få entiteter og lav topic coverage.",
-            "Udbyg med FAQ, metode, materialer, garanti-betingelser, cases, serviceområde og forventninger.",
-            4, 30,
-            evidence=f"Ordantal ≈ {word_count}"
-        ))
 
-    if page_type == "Service Page" and not has_service_area:
-        findings.append(Finding(
-            "Content Credibility", "Medium",
-            "Serviceområde ikke tydeligt",
-            "AI kan ikke matche ydelsen til geografi uden klare område-signaler.",
-            "Tilføj byer/regioner eller 'Hele Danmark' + evt. liste over områder.",
-            3, 15,
-            evidence="Ingen 'vi kører/dækker/område/Hele Danmark' signal fundet."
-        ))
 
     if page_type == "Service Page" and not has_contact_cta:
         findings.append(Finding(
@@ -1995,58 +1939,6 @@ def score_and_findings(
         ))
 
     # TECHNICAL
-    if not meta_desc:
-        findings.append(Finding(
-            "Technical Signals", "Low",
-            "Meta description mangler",
-            "Lavere kvalitet af snippets og svagere sidebeskrivelse for søgning/AI.",
-            "Tilføj unik meta description (140–160 tegn) med ydelse + område + proof.",
-            2, 10,
-            evidence="Ingen <meta name='description'> fundet."
-        ))
-
-    if not has_webpage_schema:
-        findings.append(Finding(
-            "Technical Signals", "Low",
-            "WebPage schema mangler",
-            "WebPage markup hjælper AI med at forstå sidens rolle og kontekst.",
-            "Tilføj WebPage JSON-LD (name, url, isPartOf).",
-            2, 15,
-            evidence="Schema types fundet, men ingen WebPage type.",
-            snippet=schema_snippet_suggestions(page_type).get("WebPage")
-        ))
-
-    if page_type == "Content / Article" and not has_creativework_schema:
-        findings.append(Finding(
-            "Technical Signals", "Medium",
-            "CreativeWork/Article schema mangler (indholdsside)",
-            "På guides/artikler øger CreativeWork/Article markup læsbarhed og troværdighed for AI.",
-            "Tilføj CreativeWork/Article JSON-LD med author, publisher, datoer.",
-            3, 25,
-            evidence="Content/Article side uden CreativeWork/Article schema.",
-            snippet=schema_snippet_suggestions(page_type).get("CreativeWork")
-        ))
-
-    if has_nav_dom and not has_sitenav_schema:
-        findings.append(Finding(
-            "Technical Signals", "Low",
-            "SiteNavigationElement schema mangler",
-            "Når navigation findes i DOM, kan schema gøre den mere maskinlæsbar.",
-            "Tilføj SiteNavigationElement JSON-LD (navne + URLs for hovedmenu).",
-            2, 20,
-            evidence="<nav> fundet i HTML, men SiteNavigationElement schema ikke fundet.",
-            snippet=schema_snippet_suggestions(page_type).get("SiteNavigationElement")
-        ))
-
-    if not has_canonical:
-        findings.append(Finding(
-            "Technical Signals", "Low",
-            "Canonical link mangler",
-            "Canonical hjælper AI/søgemaskiner med at forstå 'den rigtige' version af siden.",
-            "Tilføj canonical-tag (især vigtigt ved filtre/parametre).",
-            2, 10,
-            evidence="Ingen <link rel='canonical'> fundet."
-        ))
 
     if reviews_mentioned and not has_review_schema:
         findings.append(Finding(
@@ -2068,6 +1960,17 @@ def score_and_findings(
     # Sortering
     sev_rank = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
     findings.sort(key=lambda f: (sev_rank.get(f.severity, 9), -f.impact, f.effort_minutes))
+
+    # De-dup findings (avoid repeated/overlapping titles)
+    seen = set()
+    deduped: List[Finding] = []
+    for f in findings:
+        key = (f.pillar.strip().lower(), f.title.strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+    findings = deduped
 
     # --- 5) Entity map ---
     nodes: List[Dict[str, Any]] = [{"id": "page", "label": "WebPage", "type": "Page", "color": "#e2e8f0"}]
@@ -2254,244 +2157,56 @@ def score_and_findings(
         "review_google_link": bool(has_google_reviews_link),
     }
 
-    # --- 6) To-do list (missing signals) ---
-    def _todo(label: str, ok: bool, detail: str, approx_gain: float = 0.0) -> Dict[str, Any]:
-        return {
-            "label": label,
-            "ok": bool(ok),
-            "detail": detail,
-            "approx_gain": float(approx_gain),  # informational only
-        }
+    # --- 6) Single source of truth for actions ---
+    # We derive BOTH the score and the "prioritized actions" from `requirements`.
+    # `findings` below are only the "smart"/nuanced observations. Missing requirements
+    # are injected once (and only once) as prioritized actions.
 
-    todo_summary: Dict[str, Any] = {
-        "Entity Authority": {
-            "items": [
-                _todo(
-                    "Business entity schema (Organization eller LocalBusiness)",
-                    bool(org_obj) or ("Organization" in clean_schema_types) or ("LocalBusiness" in clean_schema_types),
-                    "Tilføj Organization/LocalBusiness JSON-LD med navn, url, logo, kontakt, sameAs.",
-                    3.0,
-                ),
-                _todo(
-                    "Kontaktinfo synlig (telefon eller email)",
-                    bool(nap_phone or nap_email),
-                    "Vis telefon/email tydeligt (fx footer/kontaktsektion) og gerne i schema.",
-                    1.0,
-                ),
-                _todo(
-                    "Adresse/servicebase synlig",
-                    bool(nap_address),
-                    "Tilføj adresse eller tydelig base + serviceområde.",
-                    1.0,
-                ),
-                _todo(
-                    "CVR synlig",
-                    bool(nap_cvr),
-                    "Vis CVR i footer/kontakt (og gerne i schema).",
-                    1.0,
-                ),
-                _todo(
-                    "Min. 2 sociale profiler / sameAs links",
-                    len(socials) >= 2,
-                    "Tilføj Facebook/LinkedIn/Instagram + evt. Trustpilot i sameAs.",
-                    1.5,
-                ),
-                _todo(
-                    "Om os-side findes (internt link)",
-                    bool(has_about),
-                    "Tilføj eller link til /om, /om-os, /about-us.",
-                    0.8,
-                ),
-                _todo(
-                    "Kontakt-side findes (internt link)",
-                    bool(has_contact),
-                    "Tilføj eller link til /kontakt.",
-                    0.8,
-                ),
-                _todo(
-                    "Forfatter/Person attribution (artikler/guides)",
-                    (bool(person_obj or author_visible) if page_type != "Service Page" else True),
-                    "Tilføj forfatterboks + Person schema (navn, rolle, credentials, sameAs).",
-                    2.5,
-                ),
-            ]
-        },
-        "Content Credibility": {
-            "items": [
-                _todo(
-                    "Eksterne kilder/citations (≥ 1)",
-                    external_citations >= 1,
-                    "Link til troværdige kilder (metode, materialer, standarder, datablade).",
-                    1.0,
-                ),
-                _todo(
-                    "Eksterne kilder/citations (≥ 3)",
-                    external_citations >= 3,
-                    "3+ citations giver markant stærkere trust.",
-                    2.5,
-                ),
-                _todo(
-                    "Mindst 1 trusted kilde (myndighed/standard/datablad)",
-                    len(trusted_out_links) >= 1,
-                    "Link til fx myndighed, standard, SDS/datablad, miljømærke, producentdokumentation.",
-                    1.5,
-                ),
-                _todo(
-                    "Ekspertudtalelse eller tydelig kilde-attribution",
-                    bool(has_expert_quotes),
-                    "Tilføj 1–2 korte citater/udtalelser med attribution + link til kilde.",
-                    1.5,
-                ),
-                _todo(
-                    "Proces/arbejdsgang (service-sider)",
-                    (bool(has_process) if page_type == "Service Page" else True),
-                    "Beskriv 3–6 trin (forberedelse → udførelse → efterbehandling).",
-                    1.0,
-                ),
-                _todo(
-                    "Pris-/fra-pris signal (service-sider)",
-                    (bool(has_pricing) if page_type == "Service Page" else True),
-                    "Tilføj fra-pris, priseksempler eller hvad der påvirker prisen.",
-                    1.0,
-                ),
-                _todo(
-                    "Tilstrækkeligt indhold (≥ 450 ord)",
-                    word_count >= 450,
-                    "Udbyg med FAQ, metode, materialer, garanti/vilkår, cases, serviceområde.",
-                    1.0,
-                ),
-                _todo(
-                    "Serviceområde tydeligt (service-sider)",
-                    (bool(has_service_area) if page_type == "Service Page" else True),
-                    "Tilføj byer/regioner eller 'Hele Danmark' + evt. liste over områder.",
-                    0.8,
-                ),
-                _todo(
-                    "Før/efter eller målbar dokumentation (service-sider)",
-                    (bool(has_before_after) if page_type == "Service Page" else True),
-                    "Tilføj cases, billeder eller målbar effekt.",
-                    0.5,
-                ),
-                _todo(
-                    "Kontakt-CTA tydelig (service-sider)",
-                    (bool(has_contact_cta) if page_type == "Service Page" else True),
-                    "Tilføj 'Få tilbud', 'Ring', 'Book', 'Kontakt os' + forventet svartid.",
-                    0.5,
-                ),
-            ]
-        },
-        "Technical Signals": {
-            "items": [
-                _todo(
-                    "Schema markup findes (mindst 1 type)",
-                    bool(clean_schema_types),
-                    "Tilføj mindst business entity + relevant side-type schema.",
-                    2.0,
-                ),
-                _todo(
-                    "Service schema (service-sider)",
-                    (("Service" in clean_schema_types) if page_type == "Service Page" else True),
-                    "Tilføj Service JSON-LD og link provider til organization @id.",
-                    2.5,
-                ),
-                _todo(
-                    "Review/AggregateRating schema når anmeldelser nævnes",
-                    (not reviews_mentioned) or bool(has_review_schema),
-                    "Hvis du nævner anmeldelser/stjerner, så markér dem med Review/AggregateRating.",
-                    1.5,
-                ),
-                _todo(
-                    "H1 findes",
-                    bool(has_h1),
-                    "Tilføj en tydelig H1 for siden.",
-                    1.0,
-                ),
-                _todo(
-                    "Meta description findes",
-                    bool(meta_desc),
-                    "Tilføj unik meta description (140–160 tegn).",
-                    0.5,
-                ),
-                _todo(
-                    "Canonical link findes",
-                    bool(has_canonical),
-                    "Tilføj rel=canonical.",
-                    0.5,
-                ),
-                _todo(
-                    "Privacy/cookie-link findes (internt link)",
-                    bool(has_privacy),
-                    "Tilføj link til cookie-/privatlivspolitik i footer.",
-                    0.5,
-                ),
-                _todo(
-                    "FAQPage schema når FAQ-indhold findes",
-                    (not has_faq_like) or ("FAQPage" in clean_schema_types),
-                    "Har du FAQ, så tilføj FAQPage schema.",
-                    0.8,
-                ),
-            ]
-        },
-        "Indexability": {
-            "items": [
-                _todo(
-                    "Ingen noindex (meta/X-Robots-Tag)",
-                    ("noindex" not in parse_robots_directives((meta.get("robots") or ""))) and ("noindex" not in parse_robots_directives((indexability.get("x_robots_tag") or ""))),
-                    "Fjern noindex fra meta robots eller X-Robots-Tag.",
-                    2.0,
-                ),
-                _todo(
-                    "Robots.txt tillader siden",
-                    (indexability.get("robots_txt_allows") is not False),
-                    "Tjek robots.txt (User-agent: *) og fjern disallow for denne URL.",
-                    1.0,
-                ),
-                _todo(
-                    "URL svarer 200 og er ikke blokeret",
-                    ((indexability.get("status") or 0) in (200, 201, 202)) and (not bool((indexability or {}).get("blocked"))),
-                    "Sørg for at siden svarer 200 og ikke er blokeret af robots/noindex.",
-                    3.0,
-                ),
-            ]
-        },
-    }
-
-    # Reduce to only missing items (true to-do list)
-    for _pillar, _data in todo_summary.items():
-        items = _data.get("items") or []
+    # Build todo_summary directly from requirements (no parallel rules).
+    todo_summary: Dict[str, Any] = {}
+    for _pillar, _reqs in (requirements or {}).items():
+        items = [
+            {
+                "label": r.get("label"),
+                "ok": bool(r.get("ok")),
+                "detail": r.get("detail"),
+                "approx_gain": float(r.get("impact_points") or 0.0),
+            }
+            for r in (_reqs or [])
+        ]
         missing = [it for it in items if not it.get("ok")]
         done = [it for it in items if it.get("ok")]
-        _data["missing"] = missing
-        _data["done"] = done
-        _data["missing_count"] = len(missing)
-        _data["done_count"] = len(done)
-    
-    # --- Ensure all missing todo items become prioritized findings (single list in UI) ---
-    def _severity_from_gain(g: float, pillar_name: str, label: str) -> str:
-        g = float(g or 0.0)
-        low_label = (label or "").lower()
+        todo_summary[_pillar] = {
+            "items": items,
+            "missing": missing,
+            "done": done,
+            "missing_count": len(missing),
+            "done_count": len(done),
+        }
 
-        # Indexability is usually high stakes
+    def _severity_from_points(p: float, pillar_name: str) -> str:
+        p = float(p or 0.0)
         if pillar_name == "Indexability":
-            if any(k in low_label for k in ["noindex", "robots", "200", "bloker", "blocked"]):
+            if p >= 3.0:
+                return "Critical"
+            if p >= 1.5:
                 return "High"
-            return "Medium" if g >= 1.0 else "Low"
-
-        if g >= 2.0:
+            return "Medium" if p >= 1.0 else "Low"
+        if p >= 3.0:
             return "High"
-        if g >= 1.0:
+        if p >= 1.5:
             return "Medium"
         return "Low"
 
-    def _impact_from_gain(g: float) -> int:
-        g = float(g or 0.0)
-        if g >= 3.0:
+    def _impact_from_points(p: float) -> int:
+        p = float(p or 0.0)
+        if p >= 3.0:
             return 5
-        if g >= 2.0:
+        if p >= 2.0:
             return 4
-        if g >= 1.0:
+        if p >= 1.0:
             return 3
-        if g >= 0.8:
+        if p >= 0.8:
             return 2
         return 1
 
@@ -2503,43 +2218,38 @@ def score_and_findings(
             t = (f.title or "").strip().lower()
             if not t:
                 continue
-            if ll in t or t in ll:
+            if ll == t or ll in t or t in ll:
                 return True
         return False
 
-    # Convert missing todo items → findings (if not already covered by an existing finding)
-    for _pillar, _data in (todo_summary or {}).items():
-        for it in (_data.get("missing") or []):
-            label = (it.get("label") or "").strip()
-            detail = (it.get("detail") or "").strip()
-            gain = float(it.get("approx_gain") or 0.0)
-
+    # Inject missing requirements once as the canonical prioritized action list.
+    for _pillar, _reqs in (requirements or {}).items():
+        for r in (_reqs or []):
+            if r.get("ok"):
+                continue
+            label = (r.get("label") or "").strip()
+            detail = (r.get("detail") or "").strip()
+            pts = float(r.get("impact_points") or 0.0)
             if not label:
                 continue
             if _already_covered(_pillar, label):
                 continue
 
-            sev = _severity_from_gain(gain, _pillar, label)
-            imp = _impact_from_gain(gain)
-
-            effort = 20
-            if _pillar == "Indexability":
-                effort = 10
-
             findings.append(
                 Finding(
                     pillar=_pillar,
-                    severity=sev,
+                    severity=_severity_from_points(pts, _pillar),
                     title=label,
                     why="Dette signal mangler og trækker scoren ned.",
                     how=detail or "Tilføj/ret dette signal på siden.",
-                    impact=imp,
-                    effort_minutes=effort,
-                    evidence=f"Mangler · ≈ +{gain:.1f}" if gain > 0 else "Mangler",
+                    impact=_impact_from_points(pts),
+                    effort_minutes=20 if _pillar != "Indexability" else 10,
+                    evidence=f"Mangler · ≈ +{pts:.1f}" if pts > 0 else "Mangler",
                 )
             )
 
-    # Re-sort after injecting missing items
+    # Final sort (one list, no duplicates)
+    sev_rank = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
     findings.sort(key=lambda f: (sev_rank.get(f.severity, 9), -f.impact, f.effort_minutes))
 
     return overall, entity_score, cred_score, tech_score, findings, entity_payload, detected, todo_summary
